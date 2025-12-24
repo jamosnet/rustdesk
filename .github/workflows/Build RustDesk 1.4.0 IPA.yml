@@ -1,7 +1,7 @@
-name: Build RustDesk 1.4.0 IPA (Unsigned)
+name: Build RustDesk 1.4.0 IPA (Fixed)
 
 on:
-  workflow_dispatch: # 允许手动点击运行
+  workflow_dispatch:
 
 jobs:
   build-ios:
@@ -9,11 +9,13 @@ jobs:
     runs-on: macos-latest
     
     env:
-      # 显式设置环境变量
+      # 显式设置编译器路径
       CC: /opt/homebrew/opt/llvm/bin/clang
       CXX: /opt/homebrew/opt/llvm/bin/clang++
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
+      # 强制 Flutter 使用旧版兼容模式
+      FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
 
     steps:
       # 1. 拉取代码
@@ -23,64 +25,90 @@ jobs:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. 配置 Rust (锁定旧版本)
+      # 2. 配置 Rust (锁定 1.75 版本)
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.75.0
 
-      # 3. 配置 Flutter
-      - name: Setup Flutter
+      # 3. 【关键修正】降级 Flutter 到 3.10.6 (适配 RustDesk 1.4.0)
+      - name: Setup Flutter (Downgrade)
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.10.6'  # 锁定旧版本，解决 DialogTheme 等报错
           channel: 'stable'
           cache: true
 
-      # 4. 安装依赖 (修复 Python/LLVM 环境)
-      - name: Install Dependencies
+      # 4. 安装系统依赖
+      - name: Install System Dependencies
         run: |
           brew install llvm yasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
+          # 修复 Python 环境
           pip3 install --upgrade pip setuptools --break-system-packages
+          # 安装构建脚本需要的 Python 库
           pip3 install requests --break-system-packages || true
 
-      # 5. 生成 Rust 桥接文件 (这一步必须在根目录跑)
-      - name: Generate Bridge (Rust)
+      # 5. 【关键修正】手动安装桥接生成工具
+      - name: Install Bridge Codegen
         run: |
-          if [ -f "build.py" ]; then
-            export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-            # 运行 build.py 生成必要的库文件
-            python3 build.py --target ios || echo "Warning: build.py issue (ignored)"
-          fi
+          # 显式安装对应版本的 codegen 工具，防止 build.py 自动安装失败
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid
 
-      # 6. 核心构建命令 (关键修改：增加 working-directory)
+      # 6. 生成桥接文件 (Bridge)
+      - name: Generate Bridge (Force)
+        run: |
+          export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
+          # 尝试运行官方构建脚本
+          if [ -f "build.py" ]; then
+            python3 build.py --target ios --skip-vcpkg
+          else
+            echo "build.py missing!"
+          fi
+          
+          # 检查是否生成成功，如果没成功，手动补救
+          if [ ! -f "flutter/lib/generated_bridge.dart" ]; then
+             echo "⚠️ Bridge generation failed via script. Trying manual command..."
+             # 这里的路径是根据 RustDesk 结构推断的补救措施
+             flutter_rust_bridge_codegen \
+                --rust-input src/bridge_generated.rs \
+                --dart-output flutter/lib/generated_bridge.dart \
+                --c-output flutter/ios/Runner/bridge_generated.h \
+                --class-name RustdeskImpl
+          fi
+          
+          # 再次检查
+          ls -l flutter/lib/generated_bridge.dart || echo "❌ Critical: Bridge file still missing"
+
+      # 7. 编译 IPA (无签名)
       - name: Build IPA (No Codesign)
-        working-directory: ./flutter   # <--- 关键修复：进入 flutter 子目录
+        working-directory: ./flutter
         run: |
           flutter clean
           flutter pub get
-          # 增加 --no-codesign 
+          # 禁用 iOS 签名并构建
           flutter build ios --release --no-codesign
 
-      # 7. 打包 (路径也要对应修改)
+      # 8. 打包
       - name: Package into IPA
         run: |
           mkdir Payload
-          # 因为我们在根目录找，但构建是在 flutter 目录下生成的
-          # 正确的路径通常是 build/ios/archive/Runner.xcarchive... 或者 flutter/build/...
-          # 我们直接全盘搜索 Runner.app 比较稳妥
-          APP_PATH=$(find . -name "Runner.app" | head -n 1)
+          # 搜索生成的 Runner.app
+          APP_PATH=$(find flutter/build/ios -name "Runner.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+             APP_PATH=$(find . -name "Runner.app" | head -n 1)
+          fi
           
           if [ -z "$APP_PATH" ]; then
-            echo "Error: Runner.app not found! Build likely failed."
+            echo "Error: Runner.app not found! Build failed."
             exit 1
           fi
           
-          echo "Packaging app from: $APP_PATH"
+          echo "Packaging from: $APP_PATH"
           cp -r "$APP_PATH" Payload/
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
 
-      # 8. 上传
+      # 9. 上传
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
