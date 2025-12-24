@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V46)
+name: Build RustDesk 1.4.0 IPA (Final V47)
 
 on:
   workflow_dispatch:
@@ -15,12 +15,12 @@ jobs:
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
       
-      # VCPKG 环境变量
+      # VCPKG
       VCPKG_ROOT: /usr/local/share/vcpkg
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
       
-      # 内存优化：单线程 (防止 OOM)
+      # 内存优化：单线程
       CARGO_PROFILE_RELEASE_LTO: "false"
       RUSTFLAGS: "-C codegen-units=1"
 
@@ -40,7 +40,7 @@ jobs:
           components: rustfmt
           targets: aarch64-apple-ios
 
-      # 3. Setup Flutter 3.19.6
+      # 3. Setup Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -48,7 +48,7 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装依赖 (含 nasm)
+      # 4. 安装依赖 (关键：nasm 用于编译 aom)
       - name: Install System Dependencies
         run: |
           brew install llvm yasm nasm
@@ -60,7 +60,7 @@ jobs:
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs (Classic Mode)
+      # 6. 安装 iOS Libs (关键：aom 用于 AV1)
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
@@ -68,58 +68,51 @@ jobs:
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv aom --triplet arm64-ios --classic
 
-      # 7. 降级 Rust 依赖以匹配生成器
-      - name: Downgrade Rust Crate
-        run: |
-          echo "🔧 Downgrading flutter_rust_bridge to 1.75.0..."
-          # 使用正则精准替换版本号
-          sed -i '' '/flutter_rust_bridge/s/version = "[^"]*"/version = "=1.75.0"/' Cargo.toml
-          # 检查替换结果
-          grep "flutter_rust_bridge" Cargo.toml
-          # 更新 Lock 文件
-          cargo update -p flutter_rust_bridge --precise 1.75.0
-
-      # 8. 修复 Flutter 依赖
+      # 7. 修复 Flutter 依赖 (使用新版标准，解决冲突)
       - name: Patch Dependencies
         run: |
           python3 -c "
           import yaml
           path = 'flutter/pubspec.yaml'
+          print(f'🔧 Patching {path}...')
           with open(path, 'r') as f:
               config = yaml.safe_load(f)
 
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
+          # extended_text: 兼容 Dart 3
           config['dependency_overrides']['extended_text'] = '13.0.0'
-          config['dependency_overrides']['flutter_launcher_icons'] = '0.12.0'
-          config['dependency_overrides']['ffigen'] = '7.2.0'
+          # launcher_icons & ffigen: 统一使用新版，消除底层冲突
+          config['dependency_overrides']['flutter_launcher_icons'] = '0.13.1'
+          config['dependency_overrides']['ffigen'] = '8.0.2'
           
+          # 确保 dev_dependencies 也是新版
           if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
-               config['dev_dependencies']['flutter_launcher_icons'] = '0.12.0'
+               config['dev_dependencies']['flutter_launcher_icons'] = '0.13.1'
 
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
           "
 
-      # 9. 伪造源码
+      # 8. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 10. 安装旧版 Codegen 1.75.0
-      - name: Install Bridge Codegen (Legacy)
+      # 9. 安装 Codegen 1.80.1 (恢复新版，匹配源码)
+      - name: Install Bridge Codegen (Modern)
         run: |
-          cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. Flutter Pub Get
+      # 10. Flutter Pub Get
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: flutter pub get
 
-      # 12. 【核心修复】生成桥接代码 (补上 --rust-output)
+      # 11. 生成桥接代码 (含 output 路径)
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -129,26 +122,24 @@ jobs:
             --dart-output flutter/lib/generated_bridge.dart \
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
-          
-          # 验证文件是否生成
-          echo "Checking generated file size:"
-          ls -lh src/bridge_generated.rs
 
-      # 13. Dart 3 语法补丁
+      # 12. 【关键】Dart 代码手术
+      # 1.80 生成的是 abstract 类，但源码要实例化它，所以强行去掉 abstract
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
-          echo "🔧 Patching for Dart 3..."
+          echo "🔧 Patching Dart code..."
+          # 移除 abstract
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
-          sed -i '' 's/^class wire_/final class wire_/g' generated_bridge.dart
-          sed -i '' 's/^class _/final class _/g' generated_bridge.dart
-          echo "✅ Code patched."
+          echo "✅ Abstract keyword removed."
 
-      # 14. 编译 Rust 静态库 (单线程)
+      # 13. 编译 Rust 静态库 (核心步骤)
       - name: Build Rust Static Lib
         run: |
           echo "⚙️ Configuring iOS SDK..."
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          
+          # Bindgen 路径注入，解决 aom.h / inttypes.h 报错
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
@@ -159,7 +150,7 @@ jobs:
           cp target/aarch64-apple-ios/release/librustdesk.a flutter/ios/Runner/librustdesk.a
           echo "✅ librustdesk.a generated."
 
-      # 15. 移除签名
+      # 14. 移除签名
       - name: Disable Xcode Signing
         working-directory: ./flutter/ios
         run: |
@@ -168,14 +159,14 @@ jobs:
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
 
-      # 16. 最终编译
+      # 15. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           flutter build ios --release --no-codesign
 
-      # 17. 打包上传
+      # 16. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
