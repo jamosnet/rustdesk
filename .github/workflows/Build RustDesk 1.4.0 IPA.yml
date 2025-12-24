@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V29)
+name: Build RustDesk 1.4.0 IPA (Final V30)
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
           toolchain: 1.81.0
           components: rustfmt
 
-      # 3. Setup Flutter 3.19.6
+      # 3. Setup Flutter 3.19.6 (Dart 3.3)
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -45,39 +45,31 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 5. 【核心修复】直接修改源码版本约束 + 锁定
-      # 釜底抽薪：直接把 dev_dependencies 里的 flutter_launcher_icons 改成 0.12.0
-      - name: Patch Dependencies (Deep Fix)
+      # 5. 【极简依赖修复】只锁 extended_text
+      # 升级 Codegen 后，不再需要锁 ffigen 和 launcher_icons，它们在 Dart 3 环境下是兼容的
+      - name: Patch Dependencies
         run: |
           python3 -c "
           import yaml
           path = 'flutter/pubspec.yaml'
           print(f'🔧 Patching {path}...')
-          
           with open(path, 'r') as f:
               config = yaml.safe_load(f)
-
-          # 1. 直接修改 dev_dependencies (彻底消除 ^0.13.1 的约束)
-          if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
-              print('⬇️ Downgrading dev_dependencies/flutter_launcher_icons to 0.12.0')
-              config['dev_dependencies']['flutter_launcher_icons'] = '0.12.0'
-
-          # 2. 确保 overrides 存在
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
-          # 3. 锁定 extended_text (兼容 Dart 3)
+          # 唯一必须锁定的：extended_text 13.0.0 (解决 Dart SDK 版本冲突)
           config['dependency_overrides']['extended_text'] = '13.0.0'
           
-          # 4. 锁定 ffigen (兼容 codegen 1.75.0)
-          config['dependency_overrides']['ffigen'] = '7.2.0'
-
-          # 5. 双重保险：在 overrides 里也锁定 launcher_icons
-          config['dependency_overrides']['flutter_launcher_icons'] = '0.12.0'
+          # 移除之前可能存在的冲突项，让新版工具链自动解析
+          if 'ffigen' in config['dependency_overrides']:
+              del config['dependency_overrides']['ffigen']
+          if 'flutter_launcher_icons' in config['dependency_overrides']:
+              del config['dependency_overrides']['flutter_launcher_icons']
           
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-          print('✅ pubspec.yaml patched successfully.')
+          print('✅ pubspec.yaml patched.')
           "
 
       # 6. 伪造源码
@@ -87,12 +79,13 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 7. 安装 Bridge Codegen 1.75.0
-      - name: Install Bridge Codegen (Safe Version)
+      # 7. 【核心升级】使用 Codegen 1.80.1
+      # 这个版本支持 Dart 3 的 'final class' / 'base class' 语法
+      - name: Install Bridge Codegen (Dart 3 Compatible)
         run: |
-          cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 8. 安装 Flutter 依赖 (这次没有版本冲突了)
+      # 8. 安装 Flutter 依赖
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
