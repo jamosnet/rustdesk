@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V40)
+name: Build RustDesk 1.4.0 IPA (Final V41)
 
 on:
   workflow_dispatch:
@@ -9,41 +9,32 @@ jobs:
     runs-on: macos-latest
     
     env:
-      # 基础环境
       CC: /opt/homebrew/opt/llvm/bin/clang
       CXX: /opt/homebrew/opt/llvm/bin/clang++
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
       
-      # VCPKG
+      # VCPKG 环境变量
       VCPKG_ROOT: /usr/local/share/vcpkg
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
       
-      # 内存优化：禁用 LTO 以减少内存消耗
+      # 【内存优化核心】
+      # 禁用 LTO，减少链接期内存消耗
       CARGO_PROFILE_RELEASE_LTO: "false"
+      # 将 codegen units 设为 1，虽然慢但最省内存
+      RUSTFLAGS: "-C codegen-units=1"
 
     steps:
-      # 1. 开启 4GB 虚拟内存 (防止 OOM 崩溃)
-      - name: Enable Swap
-        run: |
-          echo "🔋 Creating 4GB Swapfile..."
-          sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          echo "✅ Swap enabled. Free memory:"
-          vm_stat | perl -ne '/page size of (\d+)/; $s=$1; if (/free:\s+(\d+)/) { print $1*$s/1024/1024 . " MB\n" }'
-
-      # 2. 拉取代码
+      # 1. 拉取代码
       - name: Checkout Source Code (v1.4.0)
         uses: actions/checkout@v4
         with:
           ref: 1.4.0
           submodules: recursive
 
-      # 3. Setup Rust (1.81.0)
+      # 2. Setup Rust
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -51,7 +42,7 @@ jobs:
           components: rustfmt
           targets: aarch64-apple-ios
 
-      # 4. Setup Flutter 3.19.6
+      # 3. Setup Flutter 3.19.6
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -59,27 +50,27 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 5. 安装依赖
+      # 4. 安装依赖
       - name: Install System Dependencies
         run: |
           brew install llvm yasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 6. 安装 cargo-lipo
+      # 5. 安装 cargo-lipo
       - name: Install Cargo Lipo
         run: |
           cargo install cargo-lipo --locked
 
-      # 7. 安装 iOS Libs
+      # 6. 安装 iOS Libs (Opus)
       - name: Install iOS Libs via VCPKG
         run: |
-          echo "⚙️ Setting up vcpkg dependencies..."
+          echo "⚙️ Setting up vcpkg..."
           export VCPKG_ROOT="$VCPKG_INSTALLATION_ROOT"
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv --triplet arm64-ios --classic
 
-      # 8. 修复依赖版本 (保持有效逻辑)
+      # 7. 修复依赖版本 (Flutter依赖)
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -102,24 +93,24 @@ jobs:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
           "
 
-      # 9. 伪造源码
+      # 8. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 10. 安装 Codegen 1.80.1
-      - name: Install Bridge Codegen (Modern)
+      # 9. 安装 Codegen 1.80.1
+      - name: Install Bridge Codegen
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. Flutter Pub Get
+      # 10. Flutter Pub Get
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: flutter pub get
 
-      # 12. 生成桥接代码
+      # 11. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -129,32 +120,33 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 13. 修正 Dart 代码
+      # 12. 修正 Dart 代码
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 14. 【核心步骤】编译 Rust 静态库 (内存优化版)
+      # 13. 【核心步骤】编译 Rust 静态库 (单线程模式)
+      # 修复了 Swap 报错，改用编译器参数限制内存
       - name: Build Rust Static Lib
         run: |
           echo "⚙️ Configuring iOS SDK..."
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "SDK Path: $SDK_PATH"
           
-          # 设置关键环境变量，修复 'inttypes.h not found'
+          # 设置 Bindgen 环境变量
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
-          echo "🚀 Starting compilation with Swap enabled..."
-          # --jobs 2 稍微放宽一点并发，因为有 Swap 了
-          cargo build --target aarch64-apple-ios --release --jobs 2
+          echo "🚀 Compiling (Single Thread + Low RAM)..."
+          # --jobs 1: 绝对单线程
+          # RUSTFLAGS 在 env 中已设置为 codegen-units=1
+          cargo build --target aarch64-apple-ios --release --jobs 1
           
           mkdir -p flutter/ios/Runner
           cp target/aarch64-apple-ios/release/librustdesk.a flutter/ios/Runner/librustdesk.a
-          echo "✅ librustdesk.a generated successfully."
+          echo "✅ librustdesk.a generated."
 
-      # 15. 移除签名
+      # 14. 移除签名
       - name: Disable Xcode Signing
         working-directory: ./flutter/ios
         run: |
@@ -163,14 +155,14 @@ jobs:
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
 
-      # 16. 最终编译
+      # 15. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           flutter build ios --release --no-codesign
 
-      # 17. 打包上传
+      # 16. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
