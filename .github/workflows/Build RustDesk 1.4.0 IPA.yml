@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V6)
+name: Build RustDesk 1.4.0 IPA (Final V7)
 
 on:
   workflow_dispatch:
@@ -31,11 +31,11 @@ jobs:
           toolchain: 1.81.0
           components: rustfmt
 
-      # 3. Setup Flutter (3.10.6)
-      - name: Setup Flutter (Downgrade)
+      # 3. 【关键修改】升级 Flutter 到 3.13.9 (自带 Dart 3.1.x，满足版本要求)
+      - name: Setup Flutter (Upgrade slightly)
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.10.6'
+          flutter-version: '3.13.9' # 从 3.10.6 升到 3.13.9
           channel: 'stable'
           cache: true
 
@@ -46,7 +46,7 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install --upgrade pip setuptools --break-system-packages
 
-      # 5. 手动创建缺失的源码文件 (防止 Rust 编译报错)
+      # 5. 手动创建缺失的源码文件
       - name: Mock Missing Source Files
         run: |
           echo "⚠️ Creating dummy files..."
@@ -59,8 +59,7 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 7. 【核心新增步骤】先安装 Flutter 依赖！
-      # 必须在生成桥接文件之前运行，否则 ffigen 会报错找不到 package_config.json
+      # 7. 安装 Flutter 依赖 (这次 Dart 版本够了，应该能过)
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
@@ -92,7 +91,6 @@ jobs:
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          # 这里不需要再 clean 了，直接 build
           flutter build ios --release --no-codesign
 
       # 10. 打包
