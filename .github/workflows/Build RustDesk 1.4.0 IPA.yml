@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V36)
+name: Build RustDesk 1.4.0 IPA (Final V37)
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ jobs:
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
-      # 【核心修复】设置 VCPKG_ROOT 环境变量，让构建脚本能找到 vcpkg
+      # 必须设置 VCPKG_ROOT，否则 magnum-opus 编译脚本会报错
       VCPKG_ROOT: /usr/local/share/vcpkg
 
     steps:
@@ -54,23 +54,20 @@ jobs:
           echo "📦 Installing cargo-lipo..."
           cargo install cargo-lipo --locked
 
-      # 6. 【核心修复】通过 VCPKG 安装 iOS 依赖库 (Opus)
-      # 解决 "Couldn't find VCPKG_ROOT" 和缺库报错
+      # 6. 【核心修复】使用 Classic 模式安装 iOS 依赖
+      # 加上 --classic 参数绕过 vcpkg.json 的限制
+      # 同时安装 opus, libvpx, libyuv 确保万无一失
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg dependencies for iOS..."
-          # GitHub runner 自带 vcpkg，位于 $VCPKG_INSTALLATION_ROOT
-          # 我们将其链接到 /usr/local/share/vcpkg 以防万一
+          # 重新链接环境变量
           export VCPKG_ROOT="$VCPKG_INSTALLATION_ROOT"
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           
-          # 安装 Opus 库 (iOS arm64 架构)
-          $VCPKG_ROOT/vcpkg install opus --triplet arm64-ios
-          
-          # 如果需要，也可以安装其他常见的 RustDesk 依赖
-          # $VCPKG_ROOT/vcpkg install libvpx libyuv --triplet arm64-ios
+          # 使用 --classic 强制安装，忽略 manifest 冲突
+          $VCPKG_ROOT/vcpkg install opus libvpx libyuv --triplet arm64-ios --classic
 
-      # 7. 修正 Flutter 依赖 (V34 逻辑)
+      # 7. 修正 Flutter 依赖
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -129,12 +126,12 @@ jobs:
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 13. 手动编译 Rust 静态库 (这次环境全了，应该能过)
+      # 13. 手动编译 Rust 静态库
       - name: Build Rust Static Lib
         run: |
           echo "⚙️ Compiling Rust for iOS..."
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
-          # 使用 release 模式编译
+          # 这次 vcpkg 库都装好了，编译应该能通过
           cargo build --target aarch64-apple-ios --release
           
           mkdir -p flutter/ios/Runner
