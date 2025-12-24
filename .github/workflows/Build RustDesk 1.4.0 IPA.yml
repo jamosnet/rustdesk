@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V30)
+name: Build RustDesk 1.4.0 IPA (Final V31)
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
           toolchain: 1.81.0
           components: rustfmt
 
-      # 3. Setup Flutter 3.19.6 (Dart 3.3)
+      # 3. Setup Flutter 3.19.6
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -45,27 +45,29 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 5. 【极简依赖修复】只锁 extended_text
-      # 升级 Codegen 后，不再需要锁 ffigen 和 launcher_icons，它们在 Dart 3 环境下是兼容的
+      # 5. 依赖地狱终极修复 (V29的逻辑是正确的，继续沿用)
       - name: Patch Dependencies
         run: |
           python3 -c "
           import yaml
           path = 'flutter/pubspec.yaml'
           print(f'🔧 Patching {path}...')
+          
           with open(path, 'r') as f:
               config = yaml.safe_load(f)
+
+          # 1. 降级 dev_dependencies (源头修复)
+          if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
+              config['dev_dependencies']['flutter_launcher_icons'] = '0.12.0'
+
+          # 2. 确保 overrides
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
-          # 唯一必须锁定的：extended_text 13.0.0 (解决 Dart SDK 版本冲突)
+          # 3. 锁定三剑客
           config['dependency_overrides']['extended_text'] = '13.0.0'
-          
-          # 移除之前可能存在的冲突项，让新版工具链自动解析
-          if 'ffigen' in config['dependency_overrides']:
-              del config['dependency_overrides']['ffigen']
-          if 'flutter_launcher_icons' in config['dependency_overrides']:
-              del config['dependency_overrides']['flutter_launcher_icons']
+          config['dependency_overrides']['ffigen'] = '7.2.0'
+          config['dependency_overrides']['flutter_launcher_icons'] = '0.12.0'
           
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
@@ -79,11 +81,10 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 7. 【核心升级】使用 Codegen 1.80.1
-      # 这个版本支持 Dart 3 的 'final class' / 'base class' 语法
-      - name: Install Bridge Codegen (Dart 3 Compatible)
+      # 7. 安装旧版生成器 (保证代码结构正确)
+      - name: Install Bridge Codegen (Legacy 1.75.0)
         run: |
-          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
 
       # 8. 安装 Flutter 依赖
       - name: Install Flutter Dependencies
@@ -101,7 +102,20 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 10. 移除签名限制
+      # 10. 【核心大招】手动修复 Dart 3 语法错误
+      # 1.75.0 生成的代码缺 'final' 关键字，这里用 sed 强行加上
+      - name: Patch Generated Code for Dart 3
+        working-directory: ./flutter/lib
+        run: |
+          echo "🔧 Patching generated_bridge.dart for Dart 3 compatibility..."
+          # 给继承自 Struct 的类加 final
+          sed -i '' 's/class wire_/final class wire_/g' generated_bridge.dart
+          # 给继承自 Opaque 的类加 final (比如 _Dart_Handle)
+          sed -i '' 's/class _/final class _/g' generated_bridge.dart
+          # 修复可能的 sealed 类问题 (如果有的话)
+          echo "✅ Syntax patch applied."
+
+      # 11. 移除签名限制
       - name: Disable Xcode Signing
         working-directory: ./flutter/ios
         run: |
@@ -110,14 +124,14 @@ jobs:
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
 
-      # 11. 最终编译
+      # 12. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           flutter build ios --release --no-codesign
 
-      # 12. 打包上传
+      # 13. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
