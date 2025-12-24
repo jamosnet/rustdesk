@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V26)
+name: Build RustDesk 1.4.0 IPA (Final V27)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. Setup Rust (1.81.0) - 用于编译环境
+      # 2. Setup Rust (1.81.0)
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -45,7 +45,7 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 5. 修正 Flutter 依赖 (extended_text 锁 13.0.0)
+      # 5. 【核心修复】同时锁定 extended_text 和 ffigen
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -57,12 +57,16 @@ jobs:
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
-          # 锁定版本，防止 dart sdk 报错
+          # 1. 锁定 extended_text (兼容 Dart 3)
           config['dependency_overrides']['extended_text'] = '13.0.0'
+          
+          # 2. 【新增】锁定 ffigen 到 7.2.0
+          # 满足 codegen 1.75.0 对 (>=6.0.1, <8.0.0) 的要求
+          config['dependency_overrides']['ffigen'] = '7.2.0'
           
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-          print('✅ pubspec.yaml patched.')
+          print('✅ pubspec.yaml patched with extended_text and ffigen.')
           "
 
       # 6. 伪造源码
@@ -72,15 +76,12 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 7. 【关键调整】安装 Bridge Codegen 1.75.0
-      # 尽管 Cargo.toml 写了 1.80，但 Dart 代码似乎不兼容 1.80 生成的抽象类
-      # 强制使用 1.75.0 可以生成具体的类，解决 "Abstract class" 报错
+      # 7. 安装 Bridge Codegen 1.75.0 (保持不变)
       - name: Install Bridge Codegen (Safe Version)
         run: |
-          echo "⚠️ Forcing codegen version to 1.75.0 to ensure Dart compatibility..."
           cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
 
-      # 8. 安装 Flutter 依赖
+      # 8. 安装 Flutter 依赖 (这次会乖乖用 ffigen 7.2.0)
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
