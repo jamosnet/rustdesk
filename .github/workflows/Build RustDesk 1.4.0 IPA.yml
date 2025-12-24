@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V34)
+name: Build RustDesk 1.4.0 IPA (Final V35)
 
 on:
   workflow_dispatch:
@@ -29,9 +29,9 @@ jobs:
         with:
           toolchain: 1.81.0
           components: rustfmt
-          targets: aarch64-apple-ios, x86_64-apple-ios
+          targets: aarch64-apple-ios
 
-      # 3. Setup Flutter 3.19.6 (Dart 3.3)
+      # 3. Setup Flutter 3.19.6
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -46,65 +46,54 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 5. 安装 cargo-lipo
-      - name: Install Cargo Lipo
-        run: |
-          echo "📦 Installing cargo-lipo..."
-          cargo install cargo-lipo --locked
-
-      # 6. 【核心修复】统一依赖版本 (Align Dependencies)
-      # 让 launcher_icons 和 ffigen 都使用新版 cli_util，消除冲突
+      # 5. 修复依赖版本 (V34 验证有效)
       - name: Patch Dependencies
         run: |
           python3 -c "
           import yaml
           path = 'flutter/pubspec.yaml'
           print(f'🔧 Patching {path}...')
-          
           with open(path, 'r') as f:
               config = yaml.safe_load(f)
 
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
-          # 1. extended_text: 必须锁 13.0.0 以兼容 Dart 3
+          # 1. Dart 3 兼容
           config['dependency_overrides']['extended_text'] = '13.0.0'
           
-          # 2. flutter_launcher_icons: 锁 0.13.1 (使用新版 cli_util)
+          # 2. 统一使用新版依赖
           config['dependency_overrides']['flutter_launcher_icons'] = '0.13.1'
-          
-          # 3. ffigen: 锁 8.0.2 (使用新版 cli_util)
           config['dependency_overrides']['ffigen'] = '8.0.2'
           
-          # 清除 dev_dependencies 里的潜在干扰 (如果之前脚本改过)
+          # 清理 dev_dependencies
           if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
-               # 确保 dev_dependencies 也是新的
                config['dev_dependencies']['flutter_launcher_icons'] = '0.13.1'
 
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-          print('✅ pubspec.yaml patched: Dependencies aligned to Modern Standard.')
+          print('✅ pubspec.yaml patched.')
           "
 
-      # 7. 伪造源码
+      # 6. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 8. 安装 Codegen 1.80.1
+      # 7. 安装 Codegen 1.80.1 (新版)
       - name: Install Bridge Codegen (Modern)
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 9. 安装 Flutter 依赖 (依赖对齐后，这里应该秒过)
+      # 8. 安装 Flutter 依赖
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
           flutter pub get
 
-      # 10. 生成桥接代码
+      # 9. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -114,13 +103,31 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 11. 修正 Dart 代码 (移除 abstract)
+      # 10. 修正 Dart 代码 (移除 abstract)
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
           echo "🔧 Removing abstract keyword..."
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
           echo "✅ Code patched."
+
+      # 11. 【核心新增】手动编译 Rust 静态库
+      # Xcode 编译失败是因为缺少这个库文件
+      - name: Build Rust Static Lib
+        run: |
+          echo "⚙️ Compiling Rust for iOS..."
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
+          
+          # 仅编译真机架构 (Release)
+          cargo build --target aarch64-apple-ios --release
+          
+          # 将编译好的库放到 Flutter 此时预期的位置
+          # 尝试复制到多个可能的位置以防万一
+          mkdir -p flutter/ios/Runner
+          cp target/aarch64-apple-ios/release/librustdesk.a flutter/ios/Runner/librustdesk.a
+          
+          echo "✅ librustdesk.a compiled and copied."
+          ls -l flutter/ios/Runner/librustdesk.a
 
       # 12. 移除签名限制
       - name: Disable Xcode Signing
