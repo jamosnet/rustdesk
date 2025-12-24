@@ -6,10 +6,10 @@ on:
 jobs:
   build-ios:
     name: Build iOS
-    runs-on: macos-latest # 使用最新的 macOS 环境
+    runs-on: macos-latest
     
     env:
-      # 显式设置 LLVM 和 Clang 路径，防止旧版构建脚本找不到编译器
+      # 显式设置环境变量
       CC: /opt/homebrew/opt/llvm/bin/clang
       CXX: /opt/homebrew/opt/llvm/bin/clang++
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
@@ -23,11 +23,11 @@ jobs:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. 配置 Rust (锁定旧一点的 stable 版本以增加兼容性)
+      # 2. 配置 Rust (锁定旧版本)
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.75.0 # 锁定一个较旧的稳定版，防止新版语法检查太严
+          toolchain: 1.75.0
 
       # 3. 配置 Flutter
       - name: Setup Flutter
@@ -36,51 +36,47 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装依赖 (关键修改：修复 Python 和 LLVM 路径)
+      # 4. 安装依赖 (修复 Python/LLVM 环境)
       - name: Install Dependencies
         run: |
           brew install llvm yasm
-          # 将 LLVM 强制加入 PATH
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
-          
-          # 修复报错：加上 --break-system-packages 强制安装
           pip3 install --upgrade pip setuptools --break-system-packages
-          
-          # 如果 build.py 需要 requests 等库，也顺便装上
           pip3 install requests --break-system-packages || true
 
-      # 5. 生成 Rust 桥接文件
+      # 5. 生成 Rust 桥接文件 (这一步必须在根目录跑)
       - name: Generate Bridge (Rust)
         run: |
-          # 检查是否有 python 构建脚本
           if [ -f "build.py" ]; then
-            echo "Found build.py, running..."
-            # 同样加上环境变量以防万一
             export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-            python3 build.py --target ios || echo "Build.py failed but trying to continue..."
-          else
-            echo "No build.py found, skipping."
+            # 运行 build.py 生成必要的库文件
+            python3 build.py --target ios || echo "Warning: build.py issue (ignored)"
           fi
 
-      # 6. 核心构建命令 (无签名)
+      # 6. 核心构建命令 (关键修改：增加 working-directory)
       - name: Build IPA (No Codesign)
+        working-directory: ./flutter   # <--- 关键修复：进入 flutter 子目录
         run: |
           flutter clean
           flutter pub get
-          # 增加 release 模式和无签名参数
+          # 增加 --no-codesign 
           flutter build ios --release --no-codesign
 
-      # 7. 打包
+      # 7. 打包 (路径也要对应修改)
       - name: Package into IPA
         run: |
           mkdir Payload
-          # 查找构建出的 .app 文件
-          APP_PATH=$(find build/ios -name "*.app" | head -n 1)
+          # 因为我们在根目录找，但构建是在 flutter 目录下生成的
+          # 正确的路径通常是 build/ios/archive/Runner.xcarchive... 或者 flutter/build/...
+          # 我们直接全盘搜索 Runner.app 比较稳妥
+          APP_PATH=$(find . -name "Runner.app" | head -n 1)
+          
           if [ -z "$APP_PATH" ]; then
-            echo "Error: .app file not found!"
+            echo "Error: Runner.app not found! Build likely failed."
             exit 1
           fi
-          echo "Found app at: $APP_PATH"
+          
+          echo "Packaging app from: $APP_PATH"
           cp -r "$APP_PATH" Payload/
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
 
