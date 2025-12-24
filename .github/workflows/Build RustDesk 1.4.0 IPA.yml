@@ -29,7 +29,7 @@ jobs:
         with:
           toolchain: 1.81.0
           components: rustfmt
-          # 【核心修复】添加 iOS 交叉编译目标！
+          # 【核心修复】添加 iOS 交叉编译目标！之前报错是因为缺这个
           targets: aarch64-apple-ios, x86_64-apple-ios
 
       # 3. Setup Flutter 3.19.6
@@ -53,7 +53,17 @@ jobs:
           echo "📦 Installing cargo-lipo for iOS build..."
           cargo install cargo-lipo --locked
 
-      # 6. 修正 Flutter 依赖 (V29 逻辑)
+      # 6. 【核心修复】降级 Cargo.toml 中的 flutter_rust_bridge
+      # 必须让 Rust 库版本 (1.75.0) 与 生成器版本 (1.75.0) 一致，否则编译必挂
+      - name: Downgrade Rust Crate
+        run: |
+          echo "🔧 Downgrading flutter_rust_bridge in Cargo.toml..."
+          # 替换版本号 =1.80 -> =1.75.0
+          sed -i '' 's/=1.80/=1.75.0/g' Cargo.toml
+          # 验证修改
+          grep "flutter_rust_bridge" Cargo.toml
+
+      # 7. 修正 Flutter 依赖 (V29 逻辑)
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -80,25 +90,25 @@ jobs:
           print('✅ pubspec.yaml patched.')
           "
 
-      # 7. 伪造源码
+      # 8. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 8. 安装旧版生成器 1.75.0
+      # 9. 安装旧版生成器 1.75.0 (与 Cargo.toml 对应)
       - name: Install Bridge Codegen (Legacy)
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
 
-      # 9. 安装 Flutter 依赖
+      # 10. 安装 Flutter 依赖
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
           flutter pub get
 
-      # 10. 生成桥接代码
+      # 11. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -108,25 +118,20 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 11. 【核心修复】智能修复 Dart 3 语法错误
+      # 12. 【核心修复】智能修复 Dart 3 语法错误
+      # 因为我们用了旧版生成器，必须手动修补语法以适应新版 Flutter
       - name: Fix Dart 3 Syntax Errors
         working-directory: ./flutter/lib
         run: |
           echo "🔧 Patching generated_bridge.dart..."
-          
           # 1. 修复 Class modifiers (base/final)
-          # 将 'class wire_' 替换为 'final class wire_'
           sed -i '' 's/^class wire_/final class wire_/g' generated_bridge.dart
-          # 将 'class _' 替换为 'final class _' (针对 Opaque types)
           sed -i '' 's/^class _/final class _/g' generated_bridge.dart
-          
           # 2. 修复 Abstract class 问题
-          # 如果 RustdeskImpl 被定义为 abstract，强制移除 abstract 关键字
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
-          
           echo "✅ Dart code patched for Flutter 3.19 compatibility."
 
-      # 12. 移除签名限制
+      # 13. 移除签名限制
       - name: Disable Xcode Signing
         working-directory: ./flutter/ios
         run: |
@@ -135,7 +140,7 @@ jobs:
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
 
-      # 13. 最终编译
+      # 14. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
@@ -143,7 +148,7 @@ jobs:
           # 显式告诉 cargo 我们要构建 iOS 目标
           flutter build ios --release --no-codesign
 
-      # 14. 打包上传
+      # 15. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
