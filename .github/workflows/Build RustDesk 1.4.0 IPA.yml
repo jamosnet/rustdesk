@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Real Final)
+name: Build RustDesk 1.4.0 IPA (Final Fixed V13)
 
 on:
   workflow_dispatch:
@@ -16,25 +16,27 @@ jobs:
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
 
     steps:
-      # 1. 拉取 1.4.0 源码
+      # 1. 拉取代码
       - name: Checkout Source Code (v1.4.0)
         uses: actions/checkout@v4
         with:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. 准备 Rust 1.81 (解决依赖库过新问题)
+      # 2. Setup Rust (1.81.0)
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.81.0
           components: rustfmt
 
-      # 3. 准备 Flutter 3.13.9 (兼容 Dart 3.1)
-      - name: Setup Flutter
+      # 3. 【核心调整】升级 Flutter 到 3.19.6
+      # 这个版本自带 Dart 3.3，满足 url_launcher >=6.2.5 对 Dart 3.2+ 的要求
+      # 同时又不像 3.27 那么新，能保持对旧 API 的兼容
+      - name: Setup Flutter (Target 3.19.6)
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.13.9'
+          flutter-version: '3.19.6'
           channel: 'stable'
           cache: true
 
@@ -45,9 +47,8 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 5. 【核心修复】修正依赖版本冲突
-      # 使用 13.0.0 (真实存在的版本) 替换掉不存在的 10.1.0
-      - name: Patch Dependencies (Correct Version)
+      # 5. 【核心修复】修正依赖版本 (防止 extended_text 飘到最新版)
+      - name: Patch Dependencies
         run: |
           python3 -c "
           import yaml
@@ -61,8 +62,8 @@ jobs:
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
 
-          # 关键修正：使用 13.0.0，这是支持 Flutter 3.10+ 的正确旧版本
-          # 既能避开 14.0.0 的高版本 Dart 要求，又是真实存在的版本
+          # 锁定 extended_text 为 13.0.0 (支持 Dart 3.0+ 的稳定版)
+          # 否则它会尝试安装需要 Dart 3.5 的最新版，导致冲突
           config['dependency_overrides']['extended_text'] = '13.0.0'
           
           print('✅ Locked extended_text to 13.0.0')
