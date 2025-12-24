@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V10)
+name: Build RustDesk 1.4.0 IPA (Ultimate Fix)
 
 on:
   workflow_dispatch:
@@ -9,10 +9,12 @@ jobs:
     runs-on: macos-latest
     
     env:
+      # 显式指定编译器路径
       CC: /opt/homebrew/opt/llvm/bin/clang
       CXX: /opt/homebrew/opt/llvm/bin/clang++
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
+      # 强制 Flutter 走镜像
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
 
     steps:
@@ -23,14 +25,14 @@ jobs:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. Setup Rust (1.81.0 + rustfmt)
+      # 2. 准备 Rust 1.81 (解决依赖库过新问题)
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.81.0
           components: rustfmt
 
-      # 3. Setup Flutter (3.13.9)
+      # 3. 准备 Flutter 3.13.9 (兼容代码的 UI 版本)
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -38,63 +40,66 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装系统依赖
+      # 4. 安装系统级依赖 + PyYAML
       - name: Install System Dependencies
         run: |
           brew install llvm yasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
-          pip3 install --upgrade pip setuptools --break-system-packages
+          # 安装 PyYAML，它是本次修复的核心工具
+          pip3 install pyyaml --break-system-packages
 
-      # 5. 手动创建缺失的源码文件
+      # 5. 【核心修复】使用 PyYAML 重构 pubspec.yaml
+      # 彻底解决 "Error on line 121" 和 "Duplicate mapping key"
+      - name: Patch Dependencies (Safe Mode)
+        run: |
+          python3 -c "
+          import yaml
+          import os
+
+          path = 'flutter/pubspec.yaml'
+          print(f'🔧 Reading {path}...')
+          
+          with open(path, 'r') as f:
+              # safe_load 会忽略注释但保证结构正确，这正是我们要的
+              config = yaml.safe_load(f)
+
+          # 确保 overrides 字典存在
+          if 'dependency_overrides' not in config:
+              config['dependency_overrides'] = {}
+
+          # 强制锁定 extended_text 为旧版本 (Dart 3.0+ 兼容版)
+          # 这解决了 'version solving failed' 问题
+          config['dependency_overrides']['extended_text'] = '10.1.0'
+          
+          print('✅ Locked extended_text to 10.1.0')
+
+          # 将完全合法的 YAML 写回文件
+          with open(path, 'w') as f:
+              yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+          print('✅ pubspec.yaml rewritten successfully')
+          "
+
+      # 6. 伪造缺失的 Rust 源码文件 (防止编译器报错)
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
+          # 创建空的 bridge_generated.rs 占位
           touch src/bridge_generated.rs
 
-      # 6. 安装桥接工具
+      # 7. 安装代码生成工具
       - name: Install Bridge Codegen
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 7. 【绝对稳妥修复】修改 pubspec.yaml
-      # 不依赖 pyyaml，不使用 cat 追加，直接用原生 python 插入行
-      - name: Patch Dependencies (Native Python)
-        working-directory: ./flutter
-        run: |
-          echo "🔧 Patching pubspec.yaml..."
-          python3 -c "
-          lines = []
-          with open('pubspec.yaml', 'r') as f:
-              lines = f.readlines()
-          
-          with open('pubspec.yaml', 'w') as f:
-              for line in lines:
-                  f.write(line)
-                  # 找到 dependency_overrides 这一行，在它下面插入 extended_text
-                  if line.strip() == 'dependency_overrides:':
-                      f.write('    extended_text: 10.1.0\n')
-          "
-          echo "✅ Patch applied. Dependency conflict resolved."
-
-      # 8. 【预防报错】移除 Xcode 签名限制
-      # 防止因为没有证书导致 xcodebuild 失败
-      - name: Disable Xcode Signing
-        working-directory: ./flutter/ios
-        run: |
-          echo "🔧 Disabling Xcode signing requirements..."
-          sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = .*/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
-
-      # 9. 安装 Flutter 依赖
+      # 8. 安装 Flutter 依赖 (此时 yaml 已被完美修复)
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
+          echo "📦 Running flutter pub get..."
           flutter pub get
 
-      # 10. 生成桥接文件
+      # 9. 生成桥接代码 (Bridge)
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -104,19 +109,34 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 11. 编译 IPA
+      # 10. 【防止签名报错】阉割 Xcode 签名要求
+      - name: Disable Xcode Signing
+        working-directory: ./flutter/ios
+        run: |
+          # 暴力移除所有签名配置
+          sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = .*/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
+
+      # 11. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          # 使用 release 模式，无签名
           flutter build ios --release --no-codesign
 
-      # 12. 打包与上传
+      # 12. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
+          # 查找生成的 .app
           APP_PATH=$(find flutter/build/ios -name "Runner.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+             echo "❌ Build failed, Runner.app not found"
+             exit 1
+          fi
+          
           cp -r "$APP_PATH" Payload/
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
           
