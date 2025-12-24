@@ -1,0 +1,70 @@
+name: Build RustDesk 1.4.0 IPA (Unsigned)
+
+on:
+  workflow_dispatch: # 允许手动点击运行
+
+jobs:
+  build-ios:
+    name: Build iOS
+    runs-on: macos-13 # 使用旧一点的 macOS 环境以兼容旧版本代码
+    
+    steps:
+      # 1. 强制拉取 1.4.0 版本的代码
+      - name: Checkout Source Code (v1.4.0)
+        uses: actions/checkout@v4
+        with:
+          ref: 1.4.0 # 关键：这里锁死了版本，不管你仓库在哪，它只拉取 1.4.0
+          submodules: recursive
+
+      # 2. 配置环境 (Rust + Flutter)
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      # 3. 安装 RustDesk 旧版本编译所需的依赖 (根据历史记录补充)
+      - name: Install Dependencies
+        run: |
+          brew install llvm yasm
+          # 这是一个补丁：旧版 fetch_bridge 可能需要 python 环境
+          pip3 install --upgrade pip
+
+      # 4. 这一步是旧版 RustDesk 的关键，生成 Rust 桥接文件
+      - name: Generate Bridge (Rust)
+        run: |
+          # 尝试运行旧版的构建脚本，如果失败则尝试手动 cargo
+          if [ -f "build.py" ]; then
+            python3 build.py --target ios
+          else
+            echo "build.py not found, attempting direct flutter build..."
+          fi
+
+      # 5. 核心构建命令 (已改为无签名模式)
+      - name: Build IPA (No Codesign)
+        run: |
+          # 清理一下防止缓存冲突
+          flutter clean
+          flutter pub get
+          # 关键参数：--no-codesign 
+          flutter build ios --release --no-codesign
+
+      # 6. 打包成 Payload 结构 (因为无签名生成的是 .app，不是 .ipa，我们需要手动打包)
+      - name: Package into IPA
+        run: |
+          mkdir Payload
+          # 查找生成的 .app 文件并移动进去
+          mv build/ios/iphoneos/Runner.app Payload/
+          # 压缩为 IPA
+          zip -r RustDesk_1.4.0_Unsigned.ipa Payload
+
+      # 7. 上传结果给你下载
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustDesk-1.4.0-Unsigned-IPA
+          path: RustDesk_1.4.0_Unsigned.ipa
+          retention-days: 3
