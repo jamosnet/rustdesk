@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V43)
+name: Build RustDesk 1.4.0 IPA (Final V44)
 
 on:
   workflow_dispatch:
@@ -15,12 +15,12 @@ jobs:
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
       
-      # VCPKG 环境变量
+      # VCPKG
       VCPKG_ROOT: /usr/local/share/vcpkg
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
       
-      # 内存优化：单线程 + 无LTO (防止 OOM)
+      # 内存优化
       CARGO_PROFILE_RELEASE_LTO: "false"
       RUSTFLAGS: "-C codegen-units=1"
 
@@ -48,8 +48,7 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 【核心修复】安装系统依赖 (新增 nasm)
-      # aom 编译需要 nasm 汇编器
+      # 4. 安装依赖 (含 nasm)
       - name: Install System Dependencies
         run: |
           brew install llvm yasm nasm
@@ -61,18 +60,25 @@ jobs:
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs via VCPKG (含 aom)
+      # 6. 安装 iOS Libs (Classic Mode)
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
           export VCPKG_ROOT="$VCPKG_INSTALLATION_ROOT"
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
-          
-          # 安装 opus, libvpx, libyuv, aom
-          # --classic 绕过 manifest 限制
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv aom --triplet arm64-ios --classic
 
-      # 7. 修复 Flutter 依赖
+      # 7. 【核心修复】降级 Rust 依赖以匹配生成器
+      # 必须强制 Cargo.lock 使用 1.75.0，否则源码编译会报 E0432
+      - name: Downgrade Rust Crate
+        run: |
+          echo "🔧 Forcing flutter_rust_bridge = 1.75.0..."
+          # 修改 Cargo.toml
+          sed -i '' 's/flutter_rust_bridge = .*/flutter_rust_bridge = "=1.75.0"/' Cargo.toml
+          # 更新 Lock 文件
+          cargo update -p flutter_rust_bridge --precise 1.75.0
+
+      # 8. 修复 Flutter 依赖
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -84,35 +90,38 @@ jobs:
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
+          # extended_text 13.0.0, ffigen 7.2.0, launcher_icons 0.12.0
+          # 这组依赖是验证过能兼容旧版 bridge 的
           config['dependency_overrides']['extended_text'] = '13.0.0'
-          config['dependency_overrides']['flutter_launcher_icons'] = '0.13.1'
-          config['dependency_overrides']['ffigen'] = '8.0.2'
+          config['dependency_overrides']['flutter_launcher_icons'] = '0.12.0'
+          config['dependency_overrides']['ffigen'] = '7.2.0'
           
           if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
-               config['dev_dependencies']['flutter_launcher_icons'] = '0.13.1'
+               config['dev_dependencies']['flutter_launcher_icons'] = '0.12.0'
 
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
           "
 
-      # 8. 伪造源码
+      # 9. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 9. 安装 Codegen 1.80.1
-      - name: Install Bridge Codegen
+      # 10. 【核心修复】安装旧版 Codegen 1.75.0
+      # 这次环境全了，1.75.0 生成的代码才能被正确编译
+      - name: Install Bridge Codegen (Legacy)
         run: |
-          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
 
-      # 10. Flutter Pub Get
+      # 11. Flutter Pub Get
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: flutter pub get
 
-      # 11. 生成桥接代码
+      # 12. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -122,31 +131,35 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 12. 修正 Dart 代码
+      # 13. 【核心修复】Dart 3 语法补丁
+      # 因为用了旧生成器，代码缺 final/base，需要手动补
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
+          echo "🔧 Patching for Dart 3..."
+          # 1. 移除 abstract (允许实例化)
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
+          # 2. 补充 final 修饰符 (满足 Flutter 3.19 要求)
+          sed -i '' 's/^class wire_/final class wire_/g' generated_bridge.dart
+          sed -i '' 's/^class _/final class _/g' generated_bridge.dart
+          echo "✅ Code patched."
 
-      # 13. 编译 Rust 静态库 (单线程 + SDK路径注入)
+      # 14. 编译 Rust 静态库 (单线程 + Bindgen路径)
       - name: Build Rust Static Lib
         run: |
           echo "⚙️ Configuring iOS SDK..."
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          
-          # 关键：Bindgen 环境
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
           echo "🚀 Compiling (Single Thread)..."
-          # --jobs 1 防止 OOM
           cargo build --target aarch64-apple-ios --release --jobs 1
           
           mkdir -p flutter/ios/Runner
           cp target/aarch64-apple-ios/release/librustdesk.a flutter/ios/Runner/librustdesk.a
           echo "✅ librustdesk.a generated."
 
-      # 14. 移除签名
+      # 15. 移除签名
       - name: Disable Xcode Signing
         working-directory: ./flutter/ios
         run: |
@@ -155,14 +168,14 @@ jobs:
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
 
-      # 15. 最终编译
+      # 16. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           flutter build ios --release --no-codesign
 
-      # 16. 打包上传
+      # 17. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
