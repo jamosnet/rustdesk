@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V42)
+name: Build RustDesk 1.4.0 IPA (Final V43)
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
       
-      # 内存优化：单线程 + 无LTO
+      # 内存优化：单线程 + 无LTO (防止 OOM)
       CARGO_PROFILE_RELEASE_LTO: "false"
       RUSTFLAGS: "-C codegen-units=1"
 
@@ -48,10 +48,11 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装依赖
+      # 4. 【核心修复】安装系统依赖 (新增 nasm)
+      # aom 编译需要 nasm 汇编器
       - name: Install System Dependencies
         run: |
-          brew install llvm yasm
+          brew install llvm yasm nasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
@@ -60,15 +61,15 @@ jobs:
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 【核心修复】安装所有 iOS 依赖库 (新增 aom)
-      # 补全 aom (AV1支持)，解决 'aom/aom.h not found'
+      # 6. 安装 iOS Libs via VCPKG (含 aom)
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
           export VCPKG_ROOT="$VCPKG_INSTALLATION_ROOT"
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           
-          # 安装 opus, libvpx, libyuv 以及关键的 aom
+          # 安装 opus, libvpx, libyuv, aom
+          # --classic 绕过 manifest 限制
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv aom --triplet arm64-ios --classic
 
       # 7. 修复 Flutter 依赖
@@ -133,12 +134,12 @@ jobs:
           echo "⚙️ Configuring iOS SDK..."
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # 关键：告诉 bindgen 去哪里找 aom.h 和 inttypes.h
+          # 关键：Bindgen 环境
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
-          echo "🚀 Compiling (Single Thread + Low RAM)..."
-          # --jobs 1 必选，防止OOM
+          echo "🚀 Compiling (Single Thread)..."
+          # --jobs 1 防止 OOM
           cargo build --target aarch64-apple-ios --release --jobs 1
           
           mkdir -p flutter/ios/Runner
