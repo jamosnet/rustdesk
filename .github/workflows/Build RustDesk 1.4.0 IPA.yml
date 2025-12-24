@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V7)
+name: Build RustDesk 1.4.0 IPA (Final V8)
 
 on:
   workflow_dispatch:
@@ -31,11 +31,11 @@ jobs:
           toolchain: 1.81.0
           components: rustfmt
 
-      # 3. 【关键修改】升级 Flutter 到 3.13.9 (自带 Dart 3.1.x，满足版本要求)
-      - name: Setup Flutter (Upgrade slightly)
+      # 3. Setup Flutter (3.13.9 - 适配 Dart 3.1)
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.13.9' # 从 3.10.6 升到 3.13.9
+          flutter-version: '3.13.9'
           channel: 'stable'
           cache: true
 
@@ -59,14 +59,34 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 7. 安装 Flutter 依赖 (这次 Dart 版本够了，应该能过)
+      # 7. 【核心修复】强制降级 extended_text 等插件
+      # 通过添加 dependency_overrides 来解决版本冲突
+      - name: Patch Dependencies
+        working-directory: ./flutter
+        run: |
+          echo "🔧 Patching pubspec.yaml to force compatible versions..."
+          
+          # 在 pubspec.yaml 末尾追加 dependency_overrides
+          # extended_text 10.1.0 支持 Dart 3.0+ 但不需要 Dart 3.5
+          cat <<EOF >> pubspec.yaml
+
+          dependency_overrides:
+            extended_text: 10.1.0
+            # 也可以在这里锁定其他捣乱的包，比如:
+            # flutter_svg: 2.0.7
+          EOF
+          
+          echo "✅ Patch applied. Tail of pubspec.yaml:"
+          tail -n 10 pubspec.yaml
+
+      # 8. 安装 Flutter 依赖 (现在应该能通过了)
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
           echo "📦 Installing flutter dependencies..."
           flutter pub get
 
-      # 8. 生成桥接文件 (Bridge)
+      # 9. 生成桥接文件 (Bridge)
       - name: Generate Bridge (Manual)
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -78,7 +98,6 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
           
-          # 验证结果
           if [ -f "flutter/lib/generated_bridge.dart" ]; then
             echo "✅ Bridge generated successfully!"
           else
@@ -86,14 +105,14 @@ jobs:
             exit 1
           fi
 
-      # 9. 编译 IPA (无签名)
+      # 10. 编译 IPA (无签名)
       - name: Build IPA (No Codesign)
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           flutter build ios --release --no-codesign
 
-      # 10. 打包
+      # 11. 打包
       - name: Package into IPA
         run: |
           mkdir Payload
@@ -111,7 +130,7 @@ jobs:
           cp -r "$APP_PATH" Payload/
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
 
-      # 11. 上传
+      # 12. 上传
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
