@@ -6,65 +6,85 @@ on:
 jobs:
   build-ios:
     name: Build iOS
-    # 修改点1：macos-13 已废弃，改为 macos-latest (通常是 macOS 14/15 ARM64)
-    runs-on: macos-latest
+    runs-on: macos-latest # 使用最新的 macOS 环境
     
+    env:
+      # 显式设置 LLVM 和 Clang 路径，防止旧版构建脚本找不到编译器
+      CC: /opt/homebrew/opt/llvm/bin/clang
+      CXX: /opt/homebrew/opt/llvm/bin/clang++
+      LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
+      CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
+
     steps:
-      # 1. 强制拉取 1.4.0 版本的代码
+      # 1. 拉取代码
       - name: Checkout Source Code (v1.4.0)
         uses: actions/checkout@v4
         with:
-          ref: 1.4.0 
+          ref: 1.4.0
           submodules: recursive
 
-      # 2. 配置 Rust 环境
+      # 2. 配置 Rust (锁定旧一点的 stable 版本以增加兼容性)
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
-        
-      # 3. 配置 Flutter 环境
+        with:
+          toolchain: 1.75.0 # 锁定一个较旧的稳定版，防止新版语法检查太严
+
+      # 3. 配置 Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
           cache: true
 
-      # 4. 安装依赖
+      # 4. 安装依赖 (关键修改：修复 Python 和 LLVM 路径)
       - name: Install Dependencies
         run: |
           brew install llvm yasm
-          # 尝试升级 pip 以防止旧脚本报错
-          pip3 install --upgrade pip setuptools
+          # 将 LLVM 强制加入 PATH
+          echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
+          
+          # 修复报错：加上 --break-system-packages 强制安装
+          pip3 install --upgrade pip setuptools --break-system-packages
+          
+          # 如果 build.py 需要 requests 等库，也顺便装上
+          pip3 install requests --break-system-packages || true
 
-      # 5. 生成 Rust 桥接文件 (增加容错处理)
+      # 5. 生成 Rust 桥接文件
       - name: Generate Bridge (Rust)
         run: |
-          # 如果 build.py 存在则运行，否则跳过
+          # 检查是否有 python 构建脚本
           if [ -f "build.py" ]; then
-            python3 build.py --target ios || echo "Python build script warning (ignored)"
+            echo "Found build.py, running..."
+            # 同样加上环境变量以防万一
+            export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
+            python3 build.py --target ios || echo "Build.py failed but trying to continue..."
+          else
+            echo "No build.py found, skipping."
           fi
 
-      # 6. 核心构建命令 (无签名模式 + 禁用部分检查)
+      # 6. 核心构建命令 (无签名)
       - name: Build IPA (No Codesign)
         run: |
           flutter clean
           flutter pub get
-          # 修改点2：增加 --no-codesign，并确保 release 模式
+          # 增加 release 模式和无签名参数
           flutter build ios --release --no-codesign
 
-      # 7. 打包成 Payload 结构
+      # 7. 打包
       - name: Package into IPA
         run: |
           mkdir Payload
-          # 在新版 runner 上，路径可能会有变化，这里使用通配符查找 .app
+          # 查找构建出的 .app 文件
           APP_PATH=$(find build/ios -name "*.app" | head -n 1)
           if [ -z "$APP_PATH" ]; then
             echo "Error: .app file not found!"
             exit 1
           fi
+          echo "Found app at: $APP_PATH"
           cp -r "$APP_PATH" Payload/
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
 
-      # 8. 上传结果
+      # 8. 上传
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
