@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V37)
+name: Build RustDesk 1.4.0 IPA (Final V38)
 
 on:
   workflow_dispatch:
@@ -14,8 +14,12 @@ jobs:
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
-      # 必须设置 VCPKG_ROOT，否则 magnum-opus 编译脚本会报错
+      # VCPKG 配置
       VCPKG_ROOT: /usr/local/share/vcpkg
+      # 显式告诉 vcpkg-rs 我们要用 iOS 的库
+      VCPKGRS_TRIPLET: arm64-ios
+      # 强制静态链接
+      VCPKGRS_DYNAMIC: 0
 
     steps:
       # 1. 拉取代码
@@ -31,7 +35,7 @@ jobs:
         with:
           toolchain: 1.81.0
           components: rustfmt
-          targets: aarch64-apple-ios, x86_64-apple-ios
+          targets: aarch64-apple-ios
 
       # 3. Setup Flutter 3.19.6
       - name: Setup Flutter
@@ -51,20 +55,16 @@ jobs:
       # 5. 安装 cargo-lipo
       - name: Install Cargo Lipo
         run: |
-          echo "📦 Installing cargo-lipo..."
           cargo install cargo-lipo --locked
 
-      # 6. 【核心修复】使用 Classic 模式安装 iOS 依赖
-      # 加上 --classic 参数绕过 vcpkg.json 的限制
-      # 同时安装 opus, libvpx, libyuv 确保万无一失
+      # 6. 安装 iOS 依赖库 (Classic Mode)
       - name: Install iOS Libs via VCPKG
         run: |
-          echo "⚙️ Setting up vcpkg dependencies for iOS..."
-          # 重新链接环境变量
+          echo "⚙️ Setting up vcpkg dependencies..."
           export VCPKG_ROOT="$VCPKG_INSTALLATION_ROOT"
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           
-          # 使用 --classic 强制安装，忽略 manifest 冲突
+          # 安装核心依赖
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv --triplet arm64-ios --classic
 
       # 7. 修正 Flutter 依赖
@@ -73,7 +73,6 @@ jobs:
           python3 -c "
           import yaml
           path = 'flutter/pubspec.yaml'
-          print(f'🔧 Patching {path}...')
           with open(path, 'r') as f:
               config = yaml.safe_load(f)
 
@@ -89,7 +88,6 @@ jobs:
 
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-          print('✅ pubspec.yaml patched.')
           "
 
       # 8. 伪造源码
@@ -100,7 +98,7 @@ jobs:
           touch src/bridge_generated.rs
 
       # 9. 安装 Codegen 1.80.1
-      - name: Install Bridge Codegen (Modern)
+      - name: Install Bridge Codegen
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
@@ -126,13 +124,15 @@ jobs:
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 13. 手动编译 Rust 静态库
+      # 13. 【核心优化】手动编译 Rust 静态库 (低内存模式)
+      # 使用 --jobs 1 防止 OOM
       - name: Build Rust Static Lib
         run: |
-          echo "⚙️ Compiling Rust for iOS..."
+          echo "⚙️ Compiling Rust for iOS (Low Memory Mode)..."
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
-          # 这次 vcpkg 库都装好了，编译应该能通过
-          cargo build --target aarch64-apple-ios --release
+          
+          # 增加 -vv 查看详细日志，--jobs 1 限制并发防止崩溃
+          cargo build --target aarch64-apple-ios --release --jobs 1 -vv
           
           mkdir -p flutter/ios/Runner
           cp target/aarch64-apple-ios/release/librustdesk.a flutter/ios/Runner/librustdesk.a
