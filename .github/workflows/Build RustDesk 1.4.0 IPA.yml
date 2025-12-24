@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final Fixed V13)
+name: Build RustDesk 1.4.0 IPA (Final V25)
 
 on:
   workflow_dispatch:
@@ -30,10 +30,8 @@ jobs:
           toolchain: 1.81.0
           components: rustfmt
 
-      # 3. 【核心调整】升级 Flutter 到 3.19.6
-      # 这个版本自带 Dart 3.3，满足 url_launcher >=6.2.5 对 Dart 3.2+ 的要求
-      # 同时又不像 3.27 那么新，能保持对旧 API 的兼容
-      - name: Setup Flutter (Target 3.19.6)
+      # 3. Setup Flutter 3.19.6 (Dart 3.3) - 兼容性最好的中间版本
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.19.6'
@@ -47,48 +45,54 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 5. 【核心修复】修正依赖版本 (防止 extended_text 飘到最新版)
+      # 5. 修正 Flutter 依赖 (extended_text 锁 13.0.0)
       - name: Patch Dependencies
         run: |
           python3 -c "
           import yaml
-          
           path = 'flutter/pubspec.yaml'
           print(f'🔧 Patching {path}...')
-          
           with open(path, 'r') as f:
               config = yaml.safe_load(f)
-
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
-
-          # 锁定 extended_text 为 13.0.0 (支持 Dart 3.0+ 的稳定版)
-          # 否则它会尝试安装需要 Dart 3.5 的最新版，导致冲突
+          
+          # 锁定版本，防止 dart sdk 报错
           config['dependency_overrides']['extended_text'] = '13.0.0'
           
-          print('✅ Locked extended_text to 13.0.0')
-
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+          print('✅ pubspec.yaml patched.')
           "
 
-      # 6. 伪造源码防止报错
+      # 6. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 7. 安装代码生成工具
-      - name: Install Bridge Codegen
+      # 7. 【核心修复】自动检测并安装正确的 Bridge Codegen 版本
+      # 不再硬猜 1.80.1，而是从 Cargo.toml 里读
+      - name: Install Correct Bridge Codegen
         run: |
-          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          # 提取版本号，例如 "1.75.3"
+          FRB_VERSION=$(grep -m 1 'flutter_rust_bridge =' Cargo.toml | sed -E 's/.*= *"(=?)([0-9]+\.[0-9]+\.[0-9]+)".*/\2/')
+          
+          if [ -z "$FRB_VERSION" ]; then
+             echo "⚠️ Could not detect version, falling back to 1.80.1"
+             FRB_VERSION="1.80.1"
+          else
+             echo "✅ Detected flutter_rust_bridge version: $FRB_VERSION"
+          fi
+          
+          # 安装对应版本
+          cargo install flutter_rust_bridge_codegen --version "$FRB_VERSION" --features uuid --locked
 
       # 8. 安装 Flutter 依赖
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
-          echo "📦 Running flutter pub get..."
           flutter pub get
 
       # 9. 生成桥接代码
@@ -126,7 +130,6 @@ jobs:
              echo "❌ Build failed, Runner.app not found"
              exit 1
           fi
-          
           cp -r "$APP_PATH" Payload/
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
           
