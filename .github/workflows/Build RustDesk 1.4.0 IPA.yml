@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V8)
+name: Build RustDesk 1.4.0 IPA (Final V9)
 
 on:
   workflow_dispatch:
@@ -13,7 +13,6 @@ jobs:
       CXX: /opt/homebrew/opt/llvm/bin/clang++
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
-      # 强制 Flutter 使用旧版兼容模式
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
 
     steps:
@@ -39,12 +38,14 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装系统依赖
+      # 4. 安装系统依赖 (顺便装上 PyYAML)
       - name: Install System Dependencies
         run: |
           brew install llvm yasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install --upgrade pip setuptools --break-system-packages
+          # 安装 PyYAML 用于修改配置文件
+          pip3 install pyyaml --break-system-packages
 
       # 5. 手动创建缺失的源码文件
       - name: Mock Missing Source Files
@@ -59,27 +60,36 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 7. 【核心修复】强制降级 extended_text 等插件
-      # 通过添加 dependency_overrides 来解决版本冲突
-      - name: Patch Dependencies
+      # 7. 【核心修复】智能修改 pubspec.yaml (使用 Python)
+      # 避免 "Duplicate mapping key" 报错
+      - name: Patch Dependencies (Smart)
         working-directory: ./flutter
         run: |
-          echo "🔧 Patching pubspec.yaml to force compatible versions..."
-          
-          # 在 pubspec.yaml 末尾追加 dependency_overrides
-          # extended_text 10.1.0 支持 Dart 3.0+ 但不需要 Dart 3.5
-          cat <<EOF >> pubspec.yaml
+          echo "🔧 Patching pubspec.yaml using Python..."
+          python3 -c "
+          import yaml
+          import os
 
-          dependency_overrides:
-            extended_text: 10.1.0
-            # 也可以在这里锁定其他捣乱的包，比如:
-            # flutter_svg: 2.0.7
-          EOF
-          
-          echo "✅ Patch applied. Tail of pubspec.yaml:"
-          tail -n 10 pubspec.yaml
+          file_path = 'pubspec.yaml'
+          with open(file_path, 'r') as f:
+              data = yaml.safe_load(f) or {}
 
-      # 8. 安装 Flutter 依赖 (现在应该能通过了)
+          # 确保 dependency_overrides 存在
+          if 'dependency_overrides' not in data:
+              data['dependency_overrides'] = {}
+
+          # 强制锁定 extended_text 版本，解决 Dart SDK 冲突
+          print('Overriding extended_text to 10.1.0...')
+          data['dependency_overrides']['extended_text'] = '10.1.0'
+
+          # 写回文件
+          with open(file_path, 'w') as f:
+              yaml.dump(data, f, default_flow_style=False)
+          "
+          
+          echo "✅ pubspec.yaml patched successfully!"
+
+      # 8. 安装 Flutter 依赖 (现在应该完美了)
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
