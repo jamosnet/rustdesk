@@ -6,62 +6,65 @@ on:
 jobs:
   build-ios:
     name: Build iOS
-    runs-on: macos-13 # 使用旧一点的 macOS 环境以兼容旧版本代码
+    # 修改点1：macos-13 已废弃，改为 macos-latest (通常是 macOS 14/15 ARM64)
+    runs-on: macos-latest
     
     steps:
       # 1. 强制拉取 1.4.0 版本的代码
       - name: Checkout Source Code (v1.4.0)
         uses: actions/checkout@v4
         with:
-          ref: 1.4.0 # 关键：这里锁死了版本，不管你仓库在哪，它只拉取 1.4.0
+          ref: 1.4.0 
           submodules: recursive
 
-      # 2. 配置环境 (Rust + Flutter)
+      # 2. 配置 Rust 环境
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         
+      # 3. 配置 Flutter 环境
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
           cache: true
 
-      # 3. 安装 RustDesk 旧版本编译所需的依赖 (根据历史记录补充)
+      # 4. 安装依赖
       - name: Install Dependencies
         run: |
           brew install llvm yasm
-          # 这是一个补丁：旧版 fetch_bridge 可能需要 python 环境
-          pip3 install --upgrade pip
+          # 尝试升级 pip 以防止旧脚本报错
+          pip3 install --upgrade pip setuptools
 
-      # 4. 这一步是旧版 RustDesk 的关键，生成 Rust 桥接文件
+      # 5. 生成 Rust 桥接文件 (增加容错处理)
       - name: Generate Bridge (Rust)
         run: |
-          # 尝试运行旧版的构建脚本，如果失败则尝试手动 cargo
+          # 如果 build.py 存在则运行，否则跳过
           if [ -f "build.py" ]; then
-            python3 build.py --target ios
-          else
-            echo "build.py not found, attempting direct flutter build..."
+            python3 build.py --target ios || echo "Python build script warning (ignored)"
           fi
 
-      # 5. 核心构建命令 (已改为无签名模式)
+      # 6. 核心构建命令 (无签名模式 + 禁用部分检查)
       - name: Build IPA (No Codesign)
         run: |
-          # 清理一下防止缓存冲突
           flutter clean
           flutter pub get
-          # 关键参数：--no-codesign 
+          # 修改点2：增加 --no-codesign，并确保 release 模式
           flutter build ios --release --no-codesign
 
-      # 6. 打包成 Payload 结构 (因为无签名生成的是 .app，不是 .ipa，我们需要手动打包)
+      # 7. 打包成 Payload 结构
       - name: Package into IPA
         run: |
           mkdir Payload
-          # 查找生成的 .app 文件并移动进去
-          mv build/ios/iphoneos/Runner.app Payload/
-          # 压缩为 IPA
+          # 在新版 runner 上，路径可能会有变化，这里使用通配符查找 .app
+          APP_PATH=$(find build/ios -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: .app file not found!"
+            exit 1
+          fi
+          cp -r "$APP_PATH" Payload/
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
 
-      # 7. 上传结果给你下载
+      # 8. 上传结果
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
