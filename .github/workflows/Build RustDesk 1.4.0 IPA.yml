@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V39)
+name: Build RustDesk 1.4.0 IPA (Final V40)
 
 on:
   workflow_dispatch:
@@ -9,26 +9,41 @@ jobs:
     runs-on: macos-latest
     
     env:
-      # 基础编译器设置
+      # 基础环境
       CC: /opt/homebrew/opt/llvm/bin/clang
       CXX: /opt/homebrew/opt/llvm/bin/clang++
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
-      # VCPKG设置
+      
+      # VCPKG
       VCPKG_ROOT: /usr/local/share/vcpkg
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
+      
+      # 内存优化：禁用 LTO 以减少内存消耗
+      CARGO_PROFILE_RELEASE_LTO: "false"
 
     steps:
-      # 1. 拉取代码
+      # 1. 开启 4GB 虚拟内存 (防止 OOM 崩溃)
+      - name: Enable Swap
+        run: |
+          echo "🔋 Creating 4GB Swapfile..."
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "✅ Swap enabled. Free memory:"
+          vm_stat | perl -ne '/page size of (\d+)/; $s=$1; if (/free:\s+(\d+)/) { print $1*$s/1024/1024 . " MB\n" }'
+
+      # 2. 拉取代码
       - name: Checkout Source Code (v1.4.0)
         uses: actions/checkout@v4
         with:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. Setup Rust (1.81.0)
+      # 3. Setup Rust (1.81.0)
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -36,7 +51,7 @@ jobs:
           components: rustfmt
           targets: aarch64-apple-ios
 
-      # 3. Setup Flutter 3.19.6
+      # 4. Setup Flutter 3.19.6
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -44,29 +59,27 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装系统依赖
+      # 5. 安装依赖
       - name: Install System Dependencies
         run: |
           brew install llvm yasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 5. 安装 cargo-lipo
+      # 6. 安装 cargo-lipo
       - name: Install Cargo Lipo
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS 依赖库 (Classic Mode)
+      # 7. 安装 iOS Libs
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg dependencies..."
           export VCPKG_ROOT="$VCPKG_INSTALLATION_ROOT"
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
-          
-          # 安装核心依赖
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv --triplet arm64-ios --classic
 
-      # 7. 修正 Flutter 依赖
+      # 8. 修复依赖版本 (保持有效逻辑)
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -89,25 +102,24 @@ jobs:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
           "
 
-      # 8. 伪造源码
+      # 9. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 9. 安装 Codegen 1.80.1
-      - name: Install Bridge Codegen
+      # 10. 安装 Codegen 1.80.1
+      - name: Install Bridge Codegen (Modern)
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 10. 安装 Flutter 依赖
+      # 11. Flutter Pub Get
       - name: Install Flutter Dependencies
         working-directory: ./flutter
-        run: |
-          flutter pub get
+        run: flutter pub get
 
-      # 11. 生成桥接代码
+      # 12. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -117,34 +129,32 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 12. 修正 Dart 代码
+      # 13. 修正 Dart 代码
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 13. 【核心修复】设置 Bindgen 环境并编译 Rust
-      # 获取 iOS SDK 路径并注入 BINDGEN_EXTRA_CLANG_ARGS
+      # 14. 【核心步骤】编译 Rust 静态库 (内存优化版)
       - name: Build Rust Static Lib
         run: |
-          echo "⚙️ Configuring iOS SDK for Bindgen..."
-          
-          # 获取 SDK 路径
+          echo "⚙️ Configuring iOS SDK..."
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "Found SDK at: $SDK_PATH"
+          echo "SDK Path: $SDK_PATH"
           
-          # 设置关键环境变量，让 bindgen 能找到 inttypes.h
+          # 设置关键环境变量，修复 'inttypes.h not found'
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
-          echo "⚙️ Starting Rust compilation..."
-          cargo build --target aarch64-apple-ios --release --jobs 1
+          echo "🚀 Starting compilation with Swap enabled..."
+          # --jobs 2 稍微放宽一点并发，因为有 Swap 了
+          cargo build --target aarch64-apple-ios --release --jobs 2
           
           mkdir -p flutter/ios/Runner
           cp target/aarch64-apple-ios/release/librustdesk.a flutter/ios/Runner/librustdesk.a
-          echo "✅ librustdesk.a compiled and copied."
+          echo "✅ librustdesk.a generated successfully."
 
-      # 14. 移除签名限制
+      # 15. 移除签名
       - name: Disable Xcode Signing
         working-directory: ./flutter/ios
         run: |
@@ -153,20 +163,20 @@ jobs:
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
 
-      # 15. 最终编译
+      # 16. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           flutter build ios --release --no-codesign
 
-      # 16. 打包上传
+      # 17. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
           APP_PATH=$(find flutter/build/ios -name "Runner.app" | head -n 1)
           if [ -z "$APP_PATH" ]; then
-             echo "❌ Build failed, Runner.app not found"
+             echo "❌ Build failed"
              exit 1
           fi
           cp -r "$APP_PATH" Payload/
