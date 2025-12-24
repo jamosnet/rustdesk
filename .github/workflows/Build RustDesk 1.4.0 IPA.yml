@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V4)
+name: Build RustDesk 1.4.0 IPA (Final V5)
 
 on:
   workflow_dispatch:
@@ -24,13 +24,14 @@ jobs:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. Setup Rust (1.81.0 锁定)
+      # 2. 【修复点1】安装 Rust + rustfmt 组件
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.81.0
+          components: rustfmt  # <--- 必须加上这个，否则 codegen 会报错
 
-      # 3. Setup Flutter (3.10.6 锁定)
+      # 3. Setup Flutter (3.10.6)
       - name: Setup Flutter (Downgrade)
         uses: subosito/flutter-action@v2
         with:
@@ -45,34 +46,43 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install --upgrade pip setuptools --break-system-packages
 
-      # 5. 安装桥接工具 (锁定版本防止报错)
+      # 5. 【修复点2】手动创建缺失的源码文件 (绕过 build.py 的坑)
+      - name: Mock Missing Source Files
+        run: |
+          echo "⚠️ Creating dummy files to satisfy compiler..."
+          
+          # 创建 version.rs
+          echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
+          
+          # 创建 inline.rs (如果不存在)
+          if [ ! -f "src/inline.rs" ]; then
+             echo '// Dummy inline module' > src/inline.rs
+          fi
+          
+          # 检查 bridge_generated.rs 是否存在，不存在先创个空的防止 path 报错
+          touch src/bridge_generated.rs
+
+      # 6. 安装桥接工具
       - name: Install Bridge Codegen
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 6. 【核心修复】生成桥接文件 (修正输入文件名)
+      # 7. 生成桥接文件 (Bridge)
       - name: Generate Bridge (Manual)
         run: |
-          # 确保环境变量生效
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
-          echo "⚠️ Generating bridge manually..."
+          # 再次确认 rustfmt 是否可用
+          rustfmt --version
           
-          # 检查可能的输入文件，RustDesk 通常是 src/flutter_ffi.rs
-          INPUT_FILE="src/flutter_ffi.rs"
-          if [ ! -f "$INPUT_FILE" ]; then
-             echo "src/flutter_ffi.rs not found, trying src/lib.rs..."
-             INPUT_FILE="src/lib.rs"
-          fi
-          
-          # 运行生成命令 (注意：输入文件改成了正确的 flutter_ffi.rs)
+          # 运行生成命令
           flutter_rust_bridge_codegen \
-            --rust-input "$INPUT_FILE" \
+            --rust-input src/flutter_ffi.rs \
             --dart-output flutter/lib/generated_bridge.dart \
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
           
-          # 检查生成结果
+          # 验证结果
           if [ -f "flutter/lib/generated_bridge.dart" ]; then
             echo "✅ Bridge generated successfully!"
           else
@@ -80,7 +90,7 @@ jobs:
             exit 1
           fi
 
-      # 7. 编译 IPA (无签名)
+      # 8. 编译 IPA (无签名)
       - name: Build IPA (No Codesign)
         working-directory: ./flutter
         run: |
@@ -90,7 +100,7 @@ jobs:
           # 禁用 iOS 签名并构建
           flutter build ios --release --no-codesign
 
-      # 8. 打包
+      # 9. 打包
       - name: Package into IPA
         run: |
           mkdir Payload
@@ -108,7 +118,7 @@ jobs:
           cp -r "$APP_PATH" Payload/
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
 
-      # 9. 上传
+      # 10. 上传
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
