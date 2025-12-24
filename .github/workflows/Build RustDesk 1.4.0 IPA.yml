@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V38)
+name: Build RustDesk 1.4.0 IPA (Final V39)
 
 on:
   workflow_dispatch:
@@ -9,16 +9,15 @@ jobs:
     runs-on: macos-latest
     
     env:
+      # 基础编译器设置
       CC: /opt/homebrew/opt/llvm/bin/clang
       CXX: /opt/homebrew/opt/llvm/bin/clang++
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
-      # VCPKG 配置
+      # VCPKG设置
       VCPKG_ROOT: /usr/local/share/vcpkg
-      # 显式告诉 vcpkg-rs 我们要用 iOS 的库
       VCPKGRS_TRIPLET: arm64-ios
-      # 强制静态链接
       VCPKGRS_DYNAMIC: 0
 
     steps:
@@ -124,15 +123,22 @@ jobs:
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 13. 【核心优化】手动编译 Rust 静态库 (低内存模式)
-      # 使用 --jobs 1 防止 OOM
+      # 13. 【核心修复】设置 Bindgen 环境并编译 Rust
+      # 获取 iOS SDK 路径并注入 BINDGEN_EXTRA_CLANG_ARGS
       - name: Build Rust Static Lib
         run: |
-          echo "⚙️ Compiling Rust for iOS (Low Memory Mode)..."
+          echo "⚙️ Configuring iOS SDK for Bindgen..."
+          
+          # 获取 SDK 路径
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Found SDK at: $SDK_PATH"
+          
+          # 设置关键环境变量，让 bindgen 能找到 inttypes.h
+          export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
-          # 增加 -vv 查看详细日志，--jobs 1 限制并发防止崩溃
-          cargo build --target aarch64-apple-ios --release --jobs 1 -vv
+          echo "⚙️ Starting Rust compilation..."
+          cargo build --target aarch64-apple-ios --release --jobs 1
           
           mkdir -p flutter/ios/Runner
           cp target/aarch64-apple-ios/release/librustdesk.a flutter/ios/Runner/librustdesk.a
