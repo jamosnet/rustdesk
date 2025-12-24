@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V47)
+name: Build RustDesk 1.4.0 IPA (True Final V49)
 
 on:
   workflow_dispatch:
@@ -15,12 +15,12 @@ jobs:
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
       
-      # VCPKG
+      # VCPKG 配置
       VCPKG_ROOT: /usr/local/share/vcpkg
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
       
-      # 内存优化：单线程
+      # 内存优化：单线程 (防止 OOM)
       CARGO_PROFILE_RELEASE_LTO: "false"
       RUSTFLAGS: "-C codegen-units=1"
 
@@ -32,7 +32,7 @@ jobs:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. Setup Rust
+      # 2. Setup Rust (1.81.0)
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,7 +40,7 @@ jobs:
           components: rustfmt
           targets: aarch64-apple-ios
 
-      # 3. Setup Flutter
+      # 3. Setup Flutter 3.19.6
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -48,7 +48,7 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装依赖 (关键：nasm 用于编译 aom)
+      # 4. 安装依赖 (含 nasm)
       - name: Install System Dependencies
         run: |
           brew install llvm yasm nasm
@@ -60,7 +60,7 @@ jobs:
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs (关键：aom 用于 AV1)
+      # 6. 安装 iOS Libs (Classic Mode)
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
@@ -68,13 +68,12 @@ jobs:
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv aom --triplet arm64-ios --classic
 
-      # 7. 修复 Flutter 依赖 (使用新版标准，解决冲突)
+      # 7. 修复 Flutter 依赖 (对齐到 1.80.1 对应的工具链)
       - name: Patch Dependencies
         run: |
           python3 -c "
           import yaml
           path = 'flutter/pubspec.yaml'
-          print(f'🔧 Patching {path}...')
           with open(path, 'r') as f:
               config = yaml.safe_load(f)
 
@@ -83,11 +82,12 @@ jobs:
           
           # extended_text: 兼容 Dart 3
           config['dependency_overrides']['extended_text'] = '13.0.0'
-          # launcher_icons & ffigen: 统一使用新版，消除底层冲突
+          
+          # 统一升级到新版，以配合 Codegen 1.80.1
           config['dependency_overrides']['flutter_launcher_icons'] = '0.13.1'
           config['dependency_overrides']['ffigen'] = '8.0.2'
           
-          # 确保 dev_dependencies 也是新版
+          # 覆盖 dev_dependencies 中的旧版本约束
           if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
                config['dev_dependencies']['flutter_launcher_icons'] = '0.13.1'
 
@@ -102,8 +102,9 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 9. 安装 Codegen 1.80.1 (恢复新版，匹配源码)
-      - name: Install Bridge Codegen (Modern)
+      # 9. 【核心】安装 Codegen 1.80.1
+      # 严格匹配 Cargo.lock 中的版本
+      - name: Install Bridge Codegen (1.80.1)
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
@@ -112,7 +113,7 @@ jobs:
         working-directory: ./flutter
         run: flutter pub get
 
-      # 11. 生成桥接代码 (含 output 路径)
+      # 11. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -123,27 +124,25 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 12. 【关键】Dart 代码手术
-      # 1.80 生成的是 abstract 类，但源码要实例化它，所以强行去掉 abstract
+      # 12. 【核心修复】修补 Dart 代码
+      # 1.80.1 生成的是 abstract 类，但 RustDesk 1.4.0 源码要求它是普通类
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
           echo "🔧 Patching Dart code..."
-          # 移除 abstract
+          # 移除 abstract 关键字，允许实例化
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
           echo "✅ Abstract keyword removed."
 
-      # 13. 编译 Rust 静态库 (核心步骤)
+      # 13. 编译 Rust 静态库 (单线程 + Bindgen路径)
       - name: Build Rust Static Lib
         run: |
           echo "⚙️ Configuring iOS SDK..."
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          
-          # Bindgen 路径注入，解决 aom.h / inttypes.h 报错
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
-          echo "🚀 Compiling (Single Thread)..."
+          echo "🚀 Compiling Rust (Single Thread)..."
           cargo build --target aarch64-apple-ios --release --jobs 1
           
           mkdir -p flutter/ios/Runner
