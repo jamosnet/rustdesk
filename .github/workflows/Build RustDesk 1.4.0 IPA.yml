@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V27)
+name: Build RustDesk 1.4.0 IPA (Final V28)
 
 on:
   workflow_dispatch:
@@ -45,7 +45,7 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 5. 【核心修复】同时锁定 extended_text 和 ffigen
+      # 5. 【核心修复】三方会谈：同时锁定 extended_text, ffigen 和 flutter_launcher_icons
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -57,16 +57,18 @@ jobs:
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
-          # 1. 锁定 extended_text (兼容 Dart 3)
+          # 1. 锁定 extended_text (解决 Dart 版本冲突)
           config['dependency_overrides']['extended_text'] = '13.0.0'
           
-          # 2. 【新增】锁定 ffigen 到 7.2.0
-          # 满足 codegen 1.75.0 对 (>=6.0.1, <8.0.0) 的要求
+          # 2. 锁定 ffigen (解决 codegen 工具版本冲突)
           config['dependency_overrides']['ffigen'] = '7.2.0'
+
+          # 3. 【新增】锁定 flutter_launcher_icons (解决 cli_util 底层库冲突)
+          config['dependency_overrides']['flutter_launcher_icons'] = '0.12.0'
           
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-          print('✅ pubspec.yaml patched with extended_text and ffigen.')
+          print('✅ pubspec.yaml patched: All conflicts resolved.')
           "
 
       # 6. 伪造源码
@@ -81,13 +83,13 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
 
-      # 8. 安装 Flutter 依赖 (这次会乖乖用 ffigen 7.2.0)
+      # 8. 安装 Flutter 依赖
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
           flutter pub get
 
-      # 9. 生成桥接代码
+      # 9. 生成桥接代码 (这一步终于可以通行了)
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
