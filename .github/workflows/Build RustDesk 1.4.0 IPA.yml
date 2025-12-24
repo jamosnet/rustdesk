@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V25)
+name: Build RustDesk 1.4.0 IPA (Final V26)
 
 on:
   workflow_dispatch:
@@ -23,14 +23,14 @@ jobs:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. Setup Rust (1.81.0)
+      # 2. Setup Rust (1.81.0) - 用于编译环境
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.81.0
           components: rustfmt
 
-      # 3. Setup Flutter 3.19.6 (Dart 3.3) - 兼容性最好的中间版本
+      # 3. Setup Flutter 3.19.6
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -72,22 +72,13 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 7. 【核心修复】自动检测并安装正确的 Bridge Codegen 版本
-      # 不再硬猜 1.80.1，而是从 Cargo.toml 里读
-      - name: Install Correct Bridge Codegen
+      # 7. 【关键调整】安装 Bridge Codegen 1.75.0
+      # 尽管 Cargo.toml 写了 1.80，但 Dart 代码似乎不兼容 1.80 生成的抽象类
+      # 强制使用 1.75.0 可以生成具体的类，解决 "Abstract class" 报错
+      - name: Install Bridge Codegen (Safe Version)
         run: |
-          # 提取版本号，例如 "1.75.3"
-          FRB_VERSION=$(grep -m 1 'flutter_rust_bridge =' Cargo.toml | sed -E 's/.*= *"(=?)([0-9]+\.[0-9]+\.[0-9]+)".*/\2/')
-          
-          if [ -z "$FRB_VERSION" ]; then
-             echo "⚠️ Could not detect version, falling back to 1.80.1"
-             FRB_VERSION="1.80.1"
-          else
-             echo "✅ Detected flutter_rust_bridge version: $FRB_VERSION"
-          fi
-          
-          # 安装对应版本
-          cargo install flutter_rust_bridge_codegen --version "$FRB_VERSION" --features uuid --locked
+          echo "⚠️ Forcing codegen version to 1.75.0 to ensure Dart compatibility..."
+          cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
 
       # 8. 安装 Flutter 依赖
       - name: Install Flutter Dependencies
