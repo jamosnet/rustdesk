@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V44)
+name: Build RustDesk 1.4.0 IPA (Final V45)
 
 on:
   workflow_dispatch:
@@ -15,12 +15,12 @@ jobs:
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
       
-      # VCPKG
+      # VCPKG 环境变量
       VCPKG_ROOT: /usr/local/share/vcpkg
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
       
-      # 内存优化
+      # 内存优化：单线程 (防止 OOM)
       CARGO_PROFILE_RELEASE_LTO: "false"
       RUSTFLAGS: "-C codegen-units=1"
 
@@ -68,39 +68,47 @@ jobs:
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv aom --triplet arm64-ios --classic
 
-      # 7. 【核心修复】降级 Rust 依赖以匹配生成器
-      # 必须强制 Cargo.lock 使用 1.75.0，否则源码编译会报 E0432
+      # 7. 【核心修复】精准降级 Rust 依赖
+      # 使用正则只替换版本号部分，保留 optional = true
       - name: Downgrade Rust Crate
         run: |
-          echo "🔧 Forcing flutter_rust_bridge = 1.75.0..."
-          # 修改 Cargo.toml
-          sed -i '' 's/flutter_rust_bridge = .*/flutter_rust_bridge = "=1.75.0"/' Cargo.toml
-          # 更新 Lock 文件
+          echo "🔧 Downgrading flutter_rust_bridge to 1.75.0..."
+          # 匹配 flutter_rust_bridge 开头的行，将其中的 version = "..." 替换为 version = "=1.75.0"
+          sed -i '' '/flutter_rust_bridge/s/version = "[^"]*"/version = "=1.75.0"/' Cargo.toml
+          
+          # 打印出来检查一下，确保没破坏结构
+          grep "flutter_rust_bridge" Cargo.toml
+          
+          # 更新 Cargo.lock
           cargo update -p flutter_rust_bridge --precise 1.75.0
 
-      # 8. 修复 Flutter 依赖
+      # 8. 修复 Flutter 依赖 (Dart 3 兼容组合)
+      # 使用旧版 bridge 需要配合旧版 ffigen (7.2.0) 和 launcher_icons (0.12.0)
       - name: Patch Dependencies
         run: |
           python3 -c "
           import yaml
           path = 'flutter/pubspec.yaml'
+          print(f'🔧 Patching {path}...')
+          
           with open(path, 'r') as f:
               config = yaml.safe_load(f)
+
+          # 1. 降级 dev_dependencies
+          if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
+              config['dev_dependencies']['flutter_launcher_icons'] = '0.12.0'
 
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
-          # extended_text 13.0.0, ffigen 7.2.0, launcher_icons 0.12.0
-          # 这组依赖是验证过能兼容旧版 bridge 的
+          # 2. 锁定三剑客 (兼容旧版 Codegen)
           config['dependency_overrides']['extended_text'] = '13.0.0'
           config['dependency_overrides']['flutter_launcher_icons'] = '0.12.0'
           config['dependency_overrides']['ffigen'] = '7.2.0'
-          
-          if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
-               config['dev_dependencies']['flutter_launcher_icons'] = '0.12.0'
 
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+          print('✅ pubspec.yaml patched.')
           "
 
       # 9. 伪造源码
@@ -110,8 +118,7 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 10. 【核心修复】安装旧版 Codegen 1.75.0
-      # 这次环境全了，1.75.0 生成的代码才能被正确编译
+      # 10. 安装旧版 Codegen 1.75.0 (与 Cargo.toml 匹配)
       - name: Install Bridge Codegen (Legacy)
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
@@ -132,14 +139,14 @@ jobs:
             --class-name RustdeskImpl
 
       # 13. 【核心修复】Dart 3 语法补丁
-      # 因为用了旧生成器，代码缺 final/base，需要手动补
+      # 1.75.0 生成的代码缺 final，且可能带 abstract
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
           echo "🔧 Patching for Dart 3..."
-          # 1. 移除 abstract (允许实例化)
+          # 移除 abstract (如果存在)
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
-          # 2. 补充 final 修饰符 (满足 Flutter 3.19 要求)
+          # 补充 final 修饰符 (满足 Dart 3 要求)
           sed -i '' 's/^class wire_/final class wire_/g' generated_bridge.dart
           sed -i '' 's/^class _/final class _/g' generated_bridge.dart
           echo "✅ Code patched."
@@ -149,10 +156,13 @@ jobs:
         run: |
           echo "⚙️ Configuring iOS SDK..."
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          
+          # 注入头文件路径，解决 inttypes.h 报错
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
           echo "🚀 Compiling (Single Thread)..."
+          # --jobs 1 防止 OOM
           cargo build --target aarch64-apple-ios --release --jobs 1
           
           mkdir -p flutter/ios/Runner
