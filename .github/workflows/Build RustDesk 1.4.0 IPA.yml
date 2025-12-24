@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V33)
+name: Build RustDesk 1.4.0 IPA (Final V34)
 
 on:
   workflow_dispatch:
@@ -29,7 +29,6 @@ jobs:
         with:
           toolchain: 1.81.0
           components: rustfmt
-          # 必须包含 iOS 目标
           targets: aarch64-apple-ios, x86_64-apple-ios
 
       # 3. Setup Flutter 3.19.6 (Dart 3.3)
@@ -47,13 +46,14 @@ jobs:
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install pyyaml --break-system-packages
 
-      # 5. 安装 cargo-lipo (iOS构建必备)
+      # 5. 安装 cargo-lipo
       - name: Install Cargo Lipo
         run: |
           echo "📦 Installing cargo-lipo..."
           cargo install cargo-lipo --locked
 
-      # 6. 修复依赖地狱 (保持降级 launcher_icons)
+      # 6. 【核心修复】统一依赖版本 (Align Dependencies)
+      # 让 launcher_icons 和 ffigen 都使用新版 cli_util，消除冲突
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -64,24 +64,26 @@ jobs:
           with open(path, 'r') as f:
               config = yaml.safe_load(f)
 
-          # 降级 dev_dependencies
-          if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
-              config['dev_dependencies']['flutter_launcher_icons'] = '0.12.0'
-
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
-          # 锁定 extended_text 和 launcher_icons
+          # 1. extended_text: 必须锁 13.0.0 以兼容 Dart 3
           config['dependency_overrides']['extended_text'] = '13.0.0'
-          config['dependency_overrides']['flutter_launcher_icons'] = '0.12.0'
           
-          # 移除 ffigen 锁定，让 1.80.1 自动选择它需要的版本
-          if 'ffigen' in config['dependency_overrides']:
-              del config['dependency_overrides']['ffigen']
+          # 2. flutter_launcher_icons: 锁 0.13.1 (使用新版 cli_util)
+          config['dependency_overrides']['flutter_launcher_icons'] = '0.13.1'
           
+          # 3. ffigen: 锁 8.0.2 (使用新版 cli_util)
+          config['dependency_overrides']['ffigen'] = '8.0.2'
+          
+          # 清除 dev_dependencies 里的潜在干扰 (如果之前脚本改过)
+          if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
+               # 确保 dev_dependencies 也是新的
+               config['dev_dependencies']['flutter_launcher_icons'] = '0.13.1'
+
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-          print('✅ pubspec.yaml patched.')
+          print('✅ pubspec.yaml patched: Dependencies aligned to Modern Standard.')
           "
 
       # 7. 伪造源码
@@ -91,12 +93,12 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 8. 【关键】安装 Codegen 1.80.1 (与源码逻辑匹配)
+      # 8. 安装 Codegen 1.80.1
       - name: Install Bridge Codegen (Modern)
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 9. 安装 Flutter 依赖
+      # 9. 安装 Flutter 依赖 (依赖对齐后，这里应该秒过)
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: |
@@ -112,23 +114,13 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 11. 【核心魔法】修正生成的 Dart 代码
-      # 1. 移除 'abstract' 关键字，允许实例化
-      # 2. 确保构造函数兼容
+      # 11. 修正 Dart 代码 (移除 abstract)
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
-          echo "🔧 Surgical patching of generated_bridge.dart..."
-          
-          # 1. 移除 abstract 关键字 (解决 "is abstract and can't be instantiated")
+          echo "🔧 Removing abstract keyword..."
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
-          
-          # 2. 确保 base/final 修饰符存在 (Dart 3 要求)
-          # 1.80.1 通常会正确生成，但为了保险，再次检查 Struct/Opaque
-          # 注意：如果在 class 前面已经有修饰符，sed 可能会重复，所以这里主要依靠 1.80 的原生支持
-          # 如果 1.80 生成的代码已包含修饰符，这一步可以跳过，或只针对特定类修复
-          
-          echo "✅ Dart code patched: 'abstract' keyword removed."
+          echo "✅ Code patched."
 
       # 12. 移除签名限制
       - name: Disable Xcode Signing
