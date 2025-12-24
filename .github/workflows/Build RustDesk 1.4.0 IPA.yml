@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Fixed)
+name: Build RustDesk 1.4.0 IPA (Final V3)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,6 @@ jobs:
     runs-on: macos-latest
     
     env:
-      # 显式设置编译器路径
       CC: /opt/homebrew/opt/llvm/bin/clang
       CXX: /opt/homebrew/opt/llvm/bin/clang++
       LDFLAGS: "-L/opt/homebrew/opt/llvm/lib"
@@ -25,17 +24,17 @@ jobs:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. 配置 Rust (锁定 1.75 版本)
+      # 2. 【关键修改】升级 Rust 到 1.81.0 以满足依赖库的最新要求
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.75.0
+          toolchain: 1.81.0  # 之前是 1.75，现在为了 addr2line 必须升到 1.81
 
-      # 3. 【关键修正】降级 Flutter 到 3.10.6 (适配 RustDesk 1.4.0)
+      # 3. 降级 Flutter (保持 3.10.6 不变，为了兼容 UI 代码)
       - name: Setup Flutter (Downgrade)
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.10.6'  # 锁定旧版本，解决 DialogTheme 等报错
+          flutter-version: '3.10.6'
           channel: 'stable'
           cache: true
 
@@ -44,32 +43,29 @@ jobs:
         run: |
           brew install llvm yasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
-          # 修复 Python 环境
           pip3 install --upgrade pip setuptools --break-system-packages
-          # 安装构建脚本需要的 Python 库
           pip3 install requests --break-system-packages || true
 
-      # 5. 【关键修正】手动安装桥接生成工具
+      # 5. 【关键修改】安装桥接工具 (加上 --locked)
       - name: Install Bridge Codegen
         run: |
-          # 显式安装对应版本的 codegen 工具，防止 build.py 自动安装失败
-          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid
+          # 加上 --locked 防止依赖库瞎更新，同时 Rust 1.81 能搞定新版依赖
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
       # 6. 生成桥接文件 (Bridge)
       - name: Generate Bridge (Force)
         run: |
-          export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-          # 尝试运行官方构建脚本
+          # 确保 cargo 安装的工具在 path 里
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
+          
+          # 1. 尝试用 python 脚本跑
           if [ -f "build.py" ]; then
-            python3 build.py --target ios --skip-vcpkg
-          else
-            echo "build.py missing!"
+            python3 build.py --target ios --skip-vcpkg || echo "Python script failed, fallback to manual..."
           fi
           
-          # 检查是否生成成功，如果没成功，手动补救
+          # 2. 如果上面失败了，或者文件没生成，强制手动运行命令
           if [ ! -f "flutter/lib/generated_bridge.dart" ]; then
-             echo "⚠️ Bridge generation failed via script. Trying manual command..."
-             # 这里的路径是根据 RustDesk 结构推断的补救措施
+             echo "⚠️ Running manual codegen..."
              flutter_rust_bridge_codegen \
                 --rust-input src/bridge_generated.rs \
                 --dart-output flutter/lib/generated_bridge.dart \
@@ -77,13 +73,14 @@ jobs:
                 --class-name RustdeskImpl
           fi
           
-          # 再次检查
-          ls -l flutter/lib/generated_bridge.dart || echo "❌ Critical: Bridge file still missing"
+          # 验证
+          ls -l flutter/lib/generated_bridge.dart
 
       # 7. 编译 IPA (无签名)
       - name: Build IPA (No Codesign)
         working-directory: ./flutter
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           flutter clean
           flutter pub get
           # 禁用 iOS 签名并构建
@@ -93,7 +90,6 @@ jobs:
       - name: Package into IPA
         run: |
           mkdir Payload
-          # 搜索生成的 Runner.app
           APP_PATH=$(find flutter/build/ios -name "Runner.app" | head -n 1)
           if [ -z "$APP_PATH" ]; then
              APP_PATH=$(find . -name "Runner.app" | head -n 1)
