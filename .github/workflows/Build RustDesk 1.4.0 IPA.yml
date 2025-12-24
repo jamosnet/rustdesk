@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V3)
+name: Build RustDesk 1.4.0 IPA (Final V4)
 
 on:
   workflow_dispatch:
@@ -24,13 +24,13 @@ jobs:
           ref: 1.4.0
           submodules: recursive
 
-      # 2. 【关键修改】升级 Rust 到 1.81.0 以满足依赖库的最新要求
+      # 2. Setup Rust (1.81.0 锁定)
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.81.0  # 之前是 1.75，现在为了 addr2line 必须升到 1.81
+          toolchain: 1.81.0
 
-      # 3. 降级 Flutter (保持 3.10.6 不变，为了兼容 UI 代码)
+      # 3. Setup Flutter (3.10.6 锁定)
       - name: Setup Flutter (Downgrade)
         uses: subosito/flutter-action@v2
         with:
@@ -44,37 +44,41 @@ jobs:
           brew install llvm yasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
           pip3 install --upgrade pip setuptools --break-system-packages
-          pip3 install requests --break-system-packages || true
 
-      # 5. 【关键修改】安装桥接工具 (加上 --locked)
+      # 5. 安装桥接工具 (锁定版本防止报错)
       - name: Install Bridge Codegen
         run: |
-          # 加上 --locked 防止依赖库瞎更新，同时 Rust 1.81 能搞定新版依赖
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 6. 生成桥接文件 (Bridge)
-      - name: Generate Bridge (Force)
+      # 6. 【核心修复】生成桥接文件 (修正输入文件名)
+      - name: Generate Bridge (Manual)
         run: |
-          # 确保 cargo 安装的工具在 path 里
+          # 确保环境变量生效
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
-          # 1. 尝试用 python 脚本跑
-          if [ -f "build.py" ]; then
-            python3 build.py --target ios --skip-vcpkg || echo "Python script failed, fallback to manual..."
+          echo "⚠️ Generating bridge manually..."
+          
+          # 检查可能的输入文件，RustDesk 通常是 src/flutter_ffi.rs
+          INPUT_FILE="src/flutter_ffi.rs"
+          if [ ! -f "$INPUT_FILE" ]; then
+             echo "src/flutter_ffi.rs not found, trying src/lib.rs..."
+             INPUT_FILE="src/lib.rs"
           fi
           
-          # 2. 如果上面失败了，或者文件没生成，强制手动运行命令
-          if [ ! -f "flutter/lib/generated_bridge.dart" ]; then
-             echo "⚠️ Running manual codegen..."
-             flutter_rust_bridge_codegen \
-                --rust-input src/bridge_generated.rs \
-                --dart-output flutter/lib/generated_bridge.dart \
-                --c-output flutter/ios/Runner/bridge_generated.h \
-                --class-name RustdeskImpl
-          fi
+          # 运行生成命令 (注意：输入文件改成了正确的 flutter_ffi.rs)
+          flutter_rust_bridge_codegen \
+            --rust-input "$INPUT_FILE" \
+            --dart-output flutter/lib/generated_bridge.dart \
+            --c-output flutter/ios/Runner/bridge_generated.h \
+            --class-name RustdeskImpl
           
-          # 验证
-          ls -l flutter/lib/generated_bridge.dart
+          # 检查生成结果
+          if [ -f "flutter/lib/generated_bridge.dart" ]; then
+            echo "✅ Bridge generated successfully!"
+          else
+            echo "❌ Bridge generation failed!"
+            exit 1
+          fi
 
       # 7. 编译 IPA (无签名)
       - name: Build IPA (No Codesign)
