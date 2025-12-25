@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V61)
+name: Build RustDesk 1.4.0 IPA (Final V62)
 
 on:
   workflow_dispatch:
@@ -106,26 +106,41 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. 【核心修复】降级 Swift 版本
-      # 在 Podfile 中添加 post_install 钩子，强制所有 Pods 使用 Swift 5
-      - name: Downgrade Swift Version in Pods
+      # 11. 【核心修复】智能注入 Swift 5 配置到 Podfile
+      # 不再追加，而是找到现有的 hook 位置插入代码
+      - name: Inject Swift Version Patch
         working-directory: ./flutter/ios
         run: |
-          echo "🔧 Adding Swift 5 compatibility hook to Podfile..."
-          cat <<EOF >> Podfile
+          echo "🔧 Injecting Swift 5 config into Podfile..."
+          python3 -c "
+          path = 'Podfile'
+          with open(path, 'r') as f:
+              content = f.read()
           
-          post_install do |installer|
-            installer.pods_project.targets.each do |target|
-              target.build_configurations.each do |config|
-                config.build_settings['SWIFT_VERSION'] = '5.0'
-              end
+          # 查找 Flutter 的标准 hook 点
+          target_str = 'flutter_additional_ios_build_settings(target)'
+          
+          # 要插入的代码块：强制设置 Swift 版本为 5.0
+          injection = \"\"\"
+            flutter_additional_ios_build_settings(target)
+            target.build_configurations.each do |config|
+              config.build_settings['SWIFT_VERSION'] = '5.0'
             end
-          end
-          EOF
-          echo "✅ Hook added."
+          \"\"\"
+          
+          if target_str in content:
+              new_content = content.replace(target_str, injection)
+              with open(path, 'w') as f:
+                  f.write(new_content)
+              print('✅ Code injected successfully.')
+          else:
+              print('❌ Hook point not found, dumping content:')
+              print(content)
+              exit(1)
+          "
 
-      # 12. Flutter Pub Get & Pod Install
-      - name: Install Flutter Dependencies and Pods
+      # 12. Flutter Pub Get
+      - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: flutter pub get
 
