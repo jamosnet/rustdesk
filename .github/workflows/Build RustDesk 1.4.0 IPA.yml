@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V55)
+name: Build RustDesk 1.4.0 IPA (Final V56)
 
 on:
   workflow_dispatch:
@@ -51,14 +51,15 @@ jobs:
         run: |
           brew install llvm yasm nasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
-          pip3 install pyyaml --break-system-packages
+          # 安装 toml 用于安全修改配置
+          pip3 install pyyaml toml --break-system-packages
 
       # 5. 安装 cargo-lipo
       - name: Install Cargo Lipo
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs
+      # 6. 安装 iOS Libs via VCPKG
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
@@ -66,28 +67,48 @@ jobs:
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv aom --triplet arm64-ios --classic
 
-      # 7. 【核心修复】暴力开启 Staticlib
-      # 直接追加配置到 Cargo.toml 末尾，确保生效
-      - name: Force Enable Staticlib
+      # 7. 【核心修复】智能修改 Cargo.toml (Staticlib + Version)
+      - name: Patch Cargo.toml Safely
         run: |
-          echo "🔧 Appending staticlib config to Cargo.toml..."
-          cat >> Cargo.toml <<EOF
-
-          [lib]
-          name = "librustdesk"
-          crate-type = ["staticlib", "cdylib"]
-          EOF
+          python3 -c "
+          import toml
           
-          echo "✅ Cargo.toml patched. Tail content:"
-          tail -n 10 Cargo.toml
-
-      # 8. 降级 Rust 依赖
-      - name: Downgrade Rust Crate
-        run: |
-          sed -i '' '/flutter_rust_bridge/s/version = "[^"]*"/version = "=1.75.0"/' Cargo.toml
+          print('🔧 Reading Cargo.toml...')
+          data = toml.load('Cargo.toml')
+          
+          # 1. 强制开启 staticlib (用于 iOS 链接)
+          if 'lib' not in data:
+              data['lib'] = {}
+          
+          if 'crate-type' not in data['lib']:
+              data['lib']['crate-type'] = ['cdylib'] # 默认保留 cdylib
+          
+          if 'staticlib' not in data['lib']['crate-type']:
+              print('➕ Adding staticlib to crate-type')
+              data['lib']['crate-type'].append('staticlib')
+              
+          # 2. 降级 flutter_rust_bridge (配合旧版 codegen)
+          if 'dependencies' in data and 'flutter_rust_bridge' in data['dependencies']:
+              dep = data['dependencies']['flutter_rust_bridge']
+              print(f'Original dependency config: {dep}')
+              
+              if isinstance(dep, dict):
+                  # 保留 features 和 optional=true，只改版本
+                  dep['version'] = '=1.75.0'
+              elif isinstance(dep, str):
+                  data['dependencies']['flutter_rust_bridge'] = '=1.75.0'
+              
+              print('⬇️ Downgraded flutter_rust_bridge to 1.75.0')
+          
+          with open('Cargo.toml', 'w') as f:
+              toml.dump(data, f)
+          print('✅ Cargo.toml patched successfully')
+          "
+          
+          # 更新锁文件
           cargo update -p flutter_rust_bridge --precise 1.75.0
 
-      # 9. 修复 Flutter 依赖
+      # 8. 修复 Flutter 依赖
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -110,24 +131,24 @@ jobs:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
           "
 
-      # 10. 伪造源码
+      # 9. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 11. 安装 Codegen 1.75.0
+      # 10. 安装 Codegen 1.75.0
       - name: Install Bridge Codegen (1.75.0)
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
 
-      # 12. Flutter Pub Get
+      # 11. Flutter Pub Get
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: flutter pub get
 
-      # 13. 生成桥接代码
+      # 12. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -138,15 +159,17 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 14. Dart 3 语法补丁
+      # 13. Dart 语法补丁
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
+          echo "🔧 Patching Dart code..."
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
           sed -i '' 's/^class wire_/final class wire_/g' generated_bridge.dart
           sed -i '' 's/^class _/final class _/g' generated_bridge.dart
+          echo "✅ Code patched."
 
-      # 15. 【核心修复】编译 Rust 静态库 (搜寻模式)
+      # 14. 【核心步骤】编译 Rust 静态库
       - name: Build Rust Static Lib
         run: |
           echo "⚙️ Configuring iOS SDK..."
@@ -155,26 +178,26 @@ jobs:
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
           echo "🚀 Compiling (Single Thread)..."
-          # 先 clean 确保干净
           cargo clean -p rustdesk
+          # 关键：--features flutter 必须加上
           cargo build --target aarch64-apple-ios --release --jobs 1 --features flutter
           
-          echo "🔍 Searching for generated .a file..."
-          # 查找所有 .a 文件，排除 build 目录下的中间产物
+          echo "🔍 Searching for library..."
+          # 智能查找 libxxx.a
           LIB_PATH=$(find target/aarch64-apple-ios/release -maxdepth 1 -name "*.a" | head -n 1)
           
           if [ -z "$LIB_PATH" ]; then
-             echo "❌ Still no .a file found! Listing directory:"
+             echo "❌ Library not found. Build failed silently?"
              ls -R target/aarch64-apple-ios/release
              exit 1
           fi
           
-          echo "✅ Found library: $LIB_PATH"
+          echo "✅ Found: $LIB_PATH"
           mkdir -p flutter/ios/Runner
           cp "$LIB_PATH" flutter/ios/Runner/librustdesk.a
           echo "✅ Copied to Runner/librustdesk.a"
 
-      # 16. 移除签名
+      # 15. 移除签名
       - name: Disable Xcode Signing
         working-directory: ./flutter/ios
         run: |
@@ -183,14 +206,14 @@ jobs:
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
 
-      # 17. 最终编译
+      # 16. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           flutter build ios --release --no-codesign
 
-      # 18. 打包上传
+      # 17. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
