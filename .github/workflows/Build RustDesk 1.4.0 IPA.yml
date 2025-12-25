@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V53)
+name: Build RustDesk 1.4.0 IPA (Final V54)
 
 on:
   workflow_dispatch:
@@ -15,12 +15,10 @@ jobs:
       CPPFLAGS: "-I/opt/homebrew/opt/llvm/include"
       FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
       
-      # VCPKG 环境变量
       VCPKG_ROOT: /usr/local/share/vcpkg
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
       
-      # 内存优化：单线程 (防止 OOM)
       CARGO_PROFILE_RELEASE_LTO: "false"
       RUSTFLAGS: "-C codegen-units=1"
 
@@ -48,19 +46,19 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装依赖 (含 nasm)
+      # 4. 安装依赖 (新增 toml 用于修改配置)
       - name: Install System Dependencies
         run: |
           brew install llvm yasm nasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
-          pip3 install pyyaml --break-system-packages
+          pip3 install pyyaml toml --break-system-packages
 
       # 5. 安装 cargo-lipo
       - name: Install Cargo Lipo
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs (Classic Mode)
+      # 6. 安装 iOS Libs
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
@@ -68,7 +66,32 @@ jobs:
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv aom --triplet arm64-ios --classic
 
-      # 7. 修复 Flutter 依赖
+      # 7. 【核心修复】强制开启 staticlib 输出
+      # 必须让 Cargo 生成 .a 文件，iOS 才能链接
+      - name: Enable Staticlib
+        run: |
+          python3 -c "
+          import toml
+          
+          print('🔧 Patching Cargo.toml to enable staticlib...')
+          data = toml.load('Cargo.toml')
+          
+          if 'lib' not in data:
+              data['lib'] = {}
+          
+          # 确保 crate-type 包含 staticlib
+          if 'crate-type' not in data['lib']:
+              data['lib']['crate-type'] = ['staticlib', 'cdylib']
+          else:
+              if 'staticlib' not in data['lib']['crate-type']:
+                  data['lib']['crate-type'].append('staticlib')
+          
+          with open('Cargo.toml', 'w') as f:
+              toml.dump(data, f)
+          print('✅ Cargo.toml updated: staticlib enabled.')
+          "
+
+      # 8. 修复 Flutter 依赖
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -91,24 +114,29 @@ jobs:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
           "
 
-      # 8. 伪造源码
+      # 9. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 9. 安装 Codegen (1.80.1)
-      - name: Install Bridge Codegen
+      # 10. 智能安装 Codegen
+      - name: Install Correct Bridge Codegen
         run: |
-          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          echo "🔍 Detecting flutter_rust_bridge version..."
+          cargo update --dry-run
+          FRB_VERSION=$(cargo tree -p flutter_rust_bridge --depth 0 | head -n 1 | awk '{print $2}' | sed 's/^v//')
+          if [ -z "$FRB_VERSION" ]; then FRB_VERSION="1.80.1"; fi
+          echo "✅ Detected: $FRB_VERSION"
+          cargo install flutter_rust_bridge_codegen --version "$FRB_VERSION" --features uuid --locked
 
-      # 10. Flutter Pub Get
+      # 11. Flutter Pub Get
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: flutter pub get
 
-      # 11. 生成桥接代码 (含 output)
+      # 12. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -119,14 +147,17 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 12. 修正 Dart 代码
+      # 13. Dart 语法补丁
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
+          echo "🔧 Patching Dart code..."
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
+          sed -i '' 's/^class wire_/final class wire_/g' generated_bridge.dart
+          sed -i '' 's/^class _/final class _/g' generated_bridge.dart
+          echo "✅ Code patched."
 
-      # 13. 【核心修复】编译 Rust 静态库 (增加 --features flutter)
-      # 必须开启 flutter feature，否则 flutter_rust_bridge 依赖不会被引入，导致编译报错
+      # 14. 编译 Rust 静态库
       - name: Build Rust Static Lib
         run: |
           echo "⚙️ Configuring iOS SDK..."
@@ -135,14 +166,23 @@ jobs:
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
           echo "🚀 Compiling (Single Thread)..."
-          # 关键点：--features flutter
+          # 关键：--features flutter
           cargo build --target aarch64-apple-ios --release --jobs 1 --features flutter
           
+          # 检查文件是否存在
+          if [ -f "target/aarch64-apple-ios/release/librustdesk.a" ]; then
+              echo "✅ librustdesk.a found!"
+          else
+              echo "❌ librustdesk.a NOT FOUND. Listing target dir:"
+              find target/aarch64-apple-ios/release -maxdepth 2
+              exit 1
+          fi
+
           mkdir -p flutter/ios/Runner
           cp target/aarch64-apple-ios/release/librustdesk.a flutter/ios/Runner/librustdesk.a
-          echo "✅ librustdesk.a generated."
+          echo "✅ Library copied to Runner."
 
-      # 14. 移除签名
+      # 15. 移除签名
       - name: Disable Xcode Signing
         working-directory: ./flutter/ios
         run: |
@@ -151,14 +191,14 @@ jobs:
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
 
-      # 15. 最终编译
+      # 16. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           flutter build ios --release --no-codesign
 
-      # 16. 打包上传
+      # 17. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
