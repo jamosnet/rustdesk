@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V52)
+name: Build RustDesk 1.4.0 IPA (Final V53)
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
       
-      # 内存优化：单线程
+      # 内存优化：单线程 (防止 OOM)
       CARGO_PROFILE_RELEASE_LTO: "false"
       RUSTFLAGS: "-C codegen-units=1"
 
@@ -48,7 +48,7 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装依赖
+      # 4. 安装依赖 (含 nasm)
       - name: Install System Dependencies
         run: |
           brew install llvm yasm nasm
@@ -91,67 +91,42 @@ jobs:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
           "
 
-      # 8. 伪造源码 (暂时占位，稍后覆盖)
+      # 8. 伪造源码
       - name: Mock Missing Source Files
         run: |
           echo 'pub const VERSION: &str = "1.4.0";' > src/version.rs
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
-          # 先创建一个空的，防止 cargo tree 报错
           touch src/bridge_generated.rs
 
-      # 9. 【核心修复】精确匹配版本安装 Codegen
-      - name: Install Matching Bridge Codegen
+      # 9. 安装 Codegen (1.80.1)
+      - name: Install Bridge Codegen
         run: |
-          echo "🔍 Resolving exact flutter_rust_bridge version..."
-          # 更新一下索引以确保准确
-          cargo update --dry-run
-          # 使用 cargo tree 获取实际使用的库版本 (去掉了 v 前缀如果存在)
-          FRB_VERSION=$(cargo tree -p flutter_rust_bridge --depth 0 | head -n 1 | awk '{print $2}' | sed 's/^v//')
-          
-          if [ -z "$FRB_VERSION" ]; then
-             echo "⚠️ Failed to detect version, falling back to 1.80.1"
-             FRB_VERSION="1.80.1"
-          fi
-          
-          echo "✅ Detected flutter_rust_bridge: $FRB_VERSION"
-          echo "📦 Installing codegen tool version $FRB_VERSION..."
-          cargo install flutter_rust_bridge_codegen --version "$FRB_VERSION" --features uuid --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
       # 10. Flutter Pub Get
       - name: Install Flutter Dependencies
         working-directory: ./flutter
         run: flutter pub get
 
-      # 11. 【核心修复】手动生成桥接代码 (覆盖空文件)
-      - name: Generate Bridge Manually
+      # 11. 生成桥接代码 (含 output)
+      - name: Generate Bridge
         run: |
-          echo "⚙️ Generating Rust/Dart bridge code..."
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
-          
-          # 必须显式指定 --rust-output，否则 src/bridge_generated.rs 还是空的！
           flutter_rust_bridge_codegen \
             --rust-input src/flutter_ffi.rs \
             --rust-output src/bridge_generated.rs \
             --dart-output flutter/lib/generated_bridge.dart \
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
-            
-          echo "✅ Bridge generated. Checking file size:"
-          ls -lh src/bridge_generated.rs
 
-      # 12. Dart 3 语法补丁
+      # 12. 修正 Dart 代码
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
-          echo "🔧 Patching Dart code..."
-          # 移除 abstract
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
-          # 补充 final/base
-          sed -i '' 's/^class wire_/final class wire_/g' generated_bridge.dart
-          sed -i '' 's/^class _/final class _/g' generated_bridge.dart
-          echo "✅ Dart code patched."
 
-      # 13. 编译 Rust 静态库 (单线程)
+      # 13. 【核心修复】编译 Rust 静态库 (增加 --features flutter)
+      # 必须开启 flutter feature，否则 flutter_rust_bridge 依赖不会被引入，导致编译报错
       - name: Build Rust Static Lib
         run: |
           echo "⚙️ Configuring iOS SDK..."
@@ -160,8 +135,8 @@ jobs:
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
           echo "🚀 Compiling (Single Thread)..."
-          # 此时 src/bridge_generated.rs 已有内容，编译应该通过
-          cargo build --target aarch64-apple-ios --release --jobs 1
+          # 关键点：--features flutter
+          cargo build --target aarch64-apple-ios --release --jobs 1 --features flutter
           
           mkdir -p flutter/ios/Runner
           cp target/aarch64-apple-ios/release/librustdesk.a flutter/ios/Runner/librustdesk.a
