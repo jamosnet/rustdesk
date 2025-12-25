@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V56)
+name: Build RustDesk 1.4.0 IPA (Final V57)
 
 on:
   workflow_dispatch:
@@ -19,6 +19,7 @@ jobs:
       VCPKGRS_TRIPLET: arm64-ios
       VCPKGRS_DYNAMIC: 0
       
+      # 内存优化
       CARGO_PROFILE_RELEASE_LTO: "false"
       RUSTFLAGS: "-C codegen-units=1"
 
@@ -51,7 +52,6 @@ jobs:
         run: |
           brew install llvm yasm nasm
           echo "/opt/homebrew/opt/llvm/bin" >> $GITHUB_PATH
-          # 安装 toml 用于安全修改配置
           pip3 install pyyaml toml --break-system-packages
 
       # 5. 安装 cargo-lipo
@@ -59,7 +59,7 @@ jobs:
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs via VCPKG
+      # 6. 安装 iOS Libs (Classic Mode)
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
@@ -67,48 +67,23 @@ jobs:
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           $VCPKG_ROOT/vcpkg install opus libvpx libyuv aom --triplet arm64-ios --classic
 
-      # 7. 【核心修复】智能修改 Cargo.toml (Staticlib + Version)
-      - name: Patch Cargo.toml Safely
+      # 7. 【核心修复】强制开启 Staticlib (Python安全版)
+      - name: Enable Staticlib in Cargo.toml
         run: |
           python3 -c "
           import toml
-          
-          print('🔧 Reading Cargo.toml...')
+          print('🔧 Patching Cargo.toml...')
           data = toml.load('Cargo.toml')
-          
-          # 1. 强制开启 staticlib (用于 iOS 链接)
-          if 'lib' not in data:
-              data['lib'] = {}
-          
-          if 'crate-type' not in data['lib']:
-              data['lib']['crate-type'] = ['cdylib'] # 默认保留 cdylib
-          
+          if 'lib' not in data: data['lib'] = {}
+          if 'crate-type' not in data['lib']: data['lib']['crate-type'] = ['cdylib']
           if 'staticlib' not in data['lib']['crate-type']:
-              print('➕ Adding staticlib to crate-type')
               data['lib']['crate-type'].append('staticlib')
-              
-          # 2. 降级 flutter_rust_bridge (配合旧版 codegen)
-          if 'dependencies' in data and 'flutter_rust_bridge' in data['dependencies']:
-              dep = data['dependencies']['flutter_rust_bridge']
-              print(f'Original dependency config: {dep}')
-              
-              if isinstance(dep, dict):
-                  # 保留 features 和 optional=true，只改版本
-                  dep['version'] = '=1.75.0'
-              elif isinstance(dep, str):
-                  data['dependencies']['flutter_rust_bridge'] = '=1.75.0'
-              
-              print('⬇️ Downgraded flutter_rust_bridge to 1.75.0')
-          
           with open('Cargo.toml', 'w') as f:
               toml.dump(data, f)
-          print('✅ Cargo.toml patched successfully')
+          print('✅ Staticlib enabled.')
           "
-          
-          # 更新锁文件
-          cargo update -p flutter_rust_bridge --precise 1.75.0
 
-      # 8. 修复 Flutter 依赖
+      # 8. 修复 Flutter 依赖 (新版对齐)
       - name: Patch Dependencies
         run: |
           python3 -c "
@@ -120,12 +95,13 @@ jobs:
           if 'dependency_overrides' not in config:
               config['dependency_overrides'] = {}
           
+          # extended_text 13.0.0, 新版 launcher/ffigen
           config['dependency_overrides']['extended_text'] = '13.0.0'
-          config['dependency_overrides']['flutter_launcher_icons'] = '0.12.0'
-          config['dependency_overrides']['ffigen'] = '7.2.0'
+          config['dependency_overrides']['flutter_launcher_icons'] = '0.13.1'
+          config['dependency_overrides']['ffigen'] = '8.0.2'
           
           if 'dev_dependencies' in config and 'flutter_launcher_icons' in config['dev_dependencies']:
-               config['dev_dependencies']['flutter_launcher_icons'] = '0.12.0'
+               config['dev_dependencies']['flutter_launcher_icons'] = '0.13.1'
 
           with open(path, 'w') as f:
               yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
@@ -138,10 +114,15 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 10. 安装 Codegen 1.75.0
-      - name: Install Bridge Codegen (1.75.0)
+      # 10. 安装 Codegen (自动侦测，预计 1.80.1)
+      - name: Install Bridge Codegen
         run: |
-          cargo install flutter_rust_bridge_codegen --version 1.75.0 --features uuid --locked
+          echo "🔍 Detecting version..."
+          cargo update --dry-run
+          FRB_VERSION=$(cargo tree -p flutter_rust_bridge --depth 0 | head -n 1 | awk '{print $2}' | sed 's/^v//')
+          if [ -z "$FRB_VERSION" ]; then FRB_VERSION="1.80.1"; fi
+          echo "✅ Using version: $FRB_VERSION"
+          cargo install flutter_rust_bridge_codegen --version "$FRB_VERSION" --features uuid --locked
 
       # 11. Flutter Pub Get
       - name: Install Flutter Dependencies
@@ -159,43 +140,44 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 13. Dart 语法补丁
+      # 13. Dart 语法补丁 (针对 1.80 生成的 abstract 类)
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
           echo "🔧 Patching Dart code..."
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
-          sed -i '' 's/^class wire_/final class wire_/g' generated_bridge.dart
-          sed -i '' 's/^class _/final class _/g' generated_bridge.dart
-          echo "✅ Code patched."
+          echo "✅ Abstract keyword removed."
 
-      # 14. 【核心步骤】编译 Rust 静态库
-      - name: Build Rust Static Lib
+      # 14. 【核心修复】使用 cargo-lipo 编译 Rust
+      # 这会自动生成正确的 .a 文件并放在 target/universal 目录下
+      - name: Build Rust Static Lib (Lipo)
         run: |
           echo "⚙️ Configuring iOS SDK..."
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
-          echo "🚀 Compiling (Single Thread)..."
-          cargo clean -p rustdesk
-          # 关键：--features flutter 必须加上
-          cargo build --target aarch64-apple-ios --release --jobs 1 --features flutter
+          echo "🚀 Compiling with cargo-lipo..."
+          # 关键：启用 flutter feature
+          cargo lipo --release --targets aarch64-apple-ios --features flutter
           
-          echo "🔍 Searching for library..."
-          # 智能查找 libxxx.a
-          LIB_PATH=$(find target/aarch64-apple-ios/release -maxdepth 1 -name "*.a" | head -n 1)
-          
-          if [ -z "$LIB_PATH" ]; then
-             echo "❌ Library not found. Build failed silently?"
-             ls -R target/aarch64-apple-ios/release
-             exit 1
+          # 检查文件
+          LIB_PATH="target/universal/release/liblibrustdesk.a"
+          if [ ! -f "$LIB_PATH" ]; then
+              # 尝试另一个可能的名字
+              LIB_PATH="target/universal/release/librustdesk.a"
           fi
           
-          echo "✅ Found: $LIB_PATH"
-          mkdir -p flutter/ios/Runner
-          cp "$LIB_PATH" flutter/ios/Runner/librustdesk.a
-          echo "✅ Copied to Runner/librustdesk.a"
+          if [ -f "$LIB_PATH" ]; then
+              echo "✅ Found library at $LIB_PATH"
+              mkdir -p flutter/ios/Runner
+              cp "$LIB_PATH" flutter/ios/Runner/librustdesk.a
+              echo "✅ Copied to Runner/librustdesk.a"
+          else
+              echo "❌ Build failed, library not found!"
+              find target -name "*.a"
+              exit 1
+          fi
 
       # 15. 移除签名
       - name: Disable Xcode Signing
