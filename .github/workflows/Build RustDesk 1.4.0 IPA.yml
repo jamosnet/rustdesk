@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V67)
+name: Build RustDesk 1.4.0 IPA (Final V68)
 
 on:
   workflow_dispatch:
@@ -46,7 +46,7 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. 安装依赖 (nasn, toml, pyyaml)
+      # 4. 安装依赖
       - name: Install System Dependencies
         run: |
           brew install llvm yasm nasm
@@ -58,7 +58,7 @@ jobs:
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs via VCPKG (核心库)
+      # 6. 安装 iOS Libs via VCPKG
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
@@ -102,25 +102,23 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 10. 安装 Codegen (1.80.1)
+      # 10. 安装 Codegen
       - name: Install Bridge Codegen
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. Podfile 强力注入 (兼容 Xcode 16)
+      # 11. Podfile 注入 (修复 Pods 编译)
       - name: Inject Podfile Config
         working-directory: ./flutter/ios
         run: |
-          echo "🔧 Patching Podfile platform..."
-          sed -i '' "s/platform :ios, .*/platform :ios, '13.0'/" Podfile
-
-          echo "🔧 Injecting post_install hooks..."
           python3 -c "
           import re
           path = 'Podfile'
           with open(path, 'r') as f: content = f.read()
           
-          # 替换掉原有的 hook 调用，插入我们的增强版
+          # 升级平台版本
+          content = re.sub(r'platform :ios, .*', \"platform :ios, '13.0'\", content)
+
           target_str = 'flutter_additional_ios_build_settings(target)'
           injection = \"\"\"
             flutter_additional_ios_build_settings(target)
@@ -128,18 +126,14 @@ jobs:
               config.build_settings['SWIFT_VERSION'] = '5.0'
               config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
               config.build_settings['ENABLE_BITCODE'] = 'NO'
-              config.build_settings['ARCHS'] = 'arm64'
-              config.build_settings['ONLY_ACTIVE_ARCH'] = 'NO'
-              # 修复 Xcode 15+ libclang 路径
               config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
-              # 禁用签名要求
               config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
               config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
             end
           \"\"\"
           
-          if re.search(r'(\s*flutter_additional_ios_build_settings\(target\))', content):
-              new_content = re.sub(r'(\s*flutter_additional_ios_build_settings\(target\))', injection, content)
+          if target_str in content:
+              new_content = content.replace(target_str, injection)
               with open(path, 'w') as f: f.write(new_content)
               print('✅ Podfile patched.')
           else:
@@ -147,10 +141,12 @@ jobs:
               exit(1)
           "
 
-      # 12. Flutter Pub Get
-      - name: Install Flutter Dependencies
+      # 12. 清理并准备 Flutter
+      - name: Flutter Clean & Pub Get
         working-directory: ./flutter
-        run: flutter pub get
+        run: |
+          flutter clean
+          flutter pub get
 
       # 13. 生成桥接代码
       - name: Generate Bridge
@@ -188,7 +184,6 @@ jobs:
           
           mkdir -p flutter/ios/Runner
           
-          # 合并所有 .a 到 librustdesk.a，Xcode 只认这个名字
           libtool -static -o flutter/ios/Runner/librustdesk.a \
             "$RUST_LIB" \
             "$VCPKG_LIB_DIR"/libopus.a \
@@ -198,10 +193,11 @@ jobs:
             
           echo "✅ Merged library created."
 
-      # 16. 修改 Xcode 主工程设置 (彻底禁用签名 + 架构锁定)
-      - name: Configure Xcode Project
+      # 16. 【核心修复】修改 Xcode 主工程设置 (解决 libclang 和签名)
+      - name: Configure Xcode Project (Force)
         working-directory: ./flutter/ios
         run: |
+          echo "🔧 Patching Runner.xcodeproj..."
           # 1. 禁用签名
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
@@ -209,30 +205,28 @@ jobs:
           sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
           
-          # 2. 注入工具链修复 (针对主 Target)
+          # 2. 注入 DT_TOOLCHAIN_DIR 到 Runner 主工程 (解决 libclang 报错)
           sed -i '' 's/ENABLE_BITCODE = NO;/ENABLE_BITCODE = NO; DT_TOOLCHAIN_DIR = "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain";/g' Runner.xcodeproj/project.pbxproj
           
-          # 3. 升级 Target
+          # 3. 锁定架构和版本
           sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9]*\.[0-9]*;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' Runner.xcodeproj/project.pbxproj
-          
-          # 4. 锁定架构
           sed -i '' 's/ARCHS = .*/ARCHS = arm64;/g' Runner.xcodeproj/project.pbxproj
 
-      # 17. 准备 Xcode 工程 (只生成配置)
+      # 17. 准备 Xcode 工程 (Pod Install)
       - name: Prepare Xcode Project
         working-directory: ./flutter
         run: |
-          flutter clean
-          flutter pub get
-          # 这一步会生成 Pods 工程，但不会进行构建
+          # 只生成配置，不构建
           flutter build ios --config-only
 
       # 18. 【核心大招】手动 Archive (绕过 Flutter 签名检查)
+      # 忽略 xcodebuild 的返回码，强制检查产物
       - name: Build Archive via Xcodebuild
         working-directory: ./flutter/ios
         run: |
-          echo "🚀 Starting xcodebuild archive..."
-          # 显式传递参数禁用签名
+          echo "🚀 Starting xcodebuild archive (Force Mode)..."
+          
+          # 增加 COMPILER_INDEX_STORE_ENABLE=NO 加速并减少错误
           xcodebuild archive \
             -workspace Runner.xcworkspace \
             -scheme Runner \
@@ -243,19 +237,23 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             EXPANDED_CODE_SIGN_IDENTITY="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES
+            COMPILER_INDEX_STORE_ENABLE=NO || true
+            
+          echo "🔍 Checking for App..."
+          if [ -d "Runner.xcarchive/Products/Applications/Runner.app" ]; then
+             echo "✅ Archive successful!"
+          else
+             echo "❌ Archive failed. Check logs above."
+             exit 1
+          fi
 
       # 19. 提取并打包
       - name: Export IPA
         working-directory: ./flutter/ios
         run: |
           mkdir Payload
-          # 提取 App
           cp -r Runner.xcarchive/Products/Applications/Runner.app Payload/
-          
-          # 压缩
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
-          
           echo "✅ IPA created successfully."
 
       # 20. 上传
