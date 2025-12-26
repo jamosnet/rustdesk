@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V63)
+name: Build RustDesk 1.4.0 IPA (Final V64)
 
 on:
   workflow_dispatch:
@@ -102,25 +102,26 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 10. 安装 Codegen (1.80.1)
+      # 10. 安装 Codegen
       - name: Install Bridge Codegen
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. 【核心修复】强力注入 Podfile 配置 (iOS 13 + Swift 5 + No Bitcode)
-      - name: Inject Robust Podfile Config
+      # 11. 【核心修复】Podfile 全面升级 (iOS 13.0 + Fixes)
+      - name: Upgrade Podfile and Project
         working-directory: ./flutter/ios
         run: |
-          echo "🔧 Rewriting Podfile post_install hook..."
+          echo "🔧 Patching Podfile platform version..."
+          # 1. 修改 Platform 行: platform :ios, '11.0' -> '13.0'
+          sed -i '' "s/platform :ios, .*/platform :ios, '13.0'/" Podfile
+
+          echo "🔧 Injecting post_install fixes..."
           python3 -c "
           path = 'Podfile'
-          with open(path, 'r') as f:
-              content = f.read()
+          with open(path, 'r') as f: content = f.read()
           
-          # 这是一个更通用的注入点
+          # 这是一个更强大的 Hook，包含 DT_TOOLCHAIN_DIR 修复
           target_str = 'flutter_additional_ios_build_settings(target)'
-          
-          # 强制覆盖所有关键编译选项
           injection = \"\"\"
             flutter_additional_ios_build_settings(target)
             target.build_configurations.each do |config|
@@ -128,18 +129,23 @@ jobs:
               config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
               config.build_settings['ENABLE_BITCODE'] = 'NO'
               config.build_settings['GCC_WARN_INHIBIT_ALL_WARNINGS'] = 'YES'
+              # 修复 Xcode 15/16 libclang 链接问题
+              config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
             end
           \"\"\"
           
           if target_str in content:
               new_content = content.replace(target_str, injection)
-              with open(path, 'w') as f:
-                  f.write(new_content)
-              print('✅ Podfile patched with iOS 13.0 / Swift 5.0 / No Bitcode')
+              with open(path, 'w') as f: f.write(new_content)
+              print('✅ Podfile patched.')
           else:
-              print('❌ Failed to patch Podfile: target string not found')
+              print('❌ Hook not found!')
               exit(1)
           "
+          
+          echo "🔧 Patching Xcode Project file (Deployment Target)..."
+          # 暴力将所有 11.0 / 12.0 替换为 13.0
+          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9]*\.[0-9]*;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' Runner.xcodeproj/project.pbxproj
 
       # 12. Flutter Pub Get
       - name: Install Flutter Dependencies
@@ -179,7 +185,6 @@ jobs:
           if [ -z "$RUST_LIB" ]; then echo "❌ Rust lib not found"; exit 1; fi
           
           VCPKG_LIB_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-ios/lib"
-          
           mkdir -p flutter/ios/Runner
           
           libtool -static -o flutter/ios/Runner/librustdesk.a \
@@ -205,8 +210,10 @@ jobs:
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          # 加上 --no-codesign 确保不会因为签名问题失败
-          flutter build ios --release --no-codesign
+          # 清理旧数据，确保 Podfile 修改生效
+          flutter clean
+          flutter pub get
+          flutter build ios --release --no-codesign --verbose
 
       # 18. 打包上传
       - name: Package and Upload
