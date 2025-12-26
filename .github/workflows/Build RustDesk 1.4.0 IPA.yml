@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V69)
+name: Build RustDesk 1.4.0 IPA (Final V70)
 
 on:
   workflow_dispatch:
@@ -58,7 +58,7 @@ jobs:
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs
+      # 6. 安装 iOS Libs via VCPKG
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
@@ -107,8 +107,7 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. 【核心修复】创建自签名证书
-      # 生成一个临时的 Code Signing 证书并添加到钥匙串
+      # 11. 【核心修复】创建自签名证书 (带密码 + 兼容模式)
       - name: Create Self-Signed Certificate
         run: |
           echo "🔐 Creating temporary keychain..."
@@ -118,17 +117,27 @@ jobs:
           security unlock-keychain -p "" build.keychain
           
           echo "🔐 Generating Self-Signed Certificate..."
-          # 创建私钥和证书
+          # 1. 生成 Key 和 CRT
           openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
             -keyout selfsigned.key -out selfsigned.crt \
             -subj "/CN=iPhone Developer: Temp User (123456)/C=US"
           
-          # 转换为 p12 格式以便导入
-          openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
-            -out selfsigned.p12 -name "iPhone Developer: Temp User (123456)" -passout pass:
+          # 2. 导出 P12 (关键：使用密码 '123456'，并尝试添加 -legacy 参数以防 OpenSSL 3.x 兼容性问题)
+          # 如果 openssl 不支持 -legacy (比如是 LibreSSL)，则去掉该参数重试
+          if openssl pkcs12 -help 2>&1 | grep -q "legacy"; then
+              echo "Using legacy mode for OpenSSL..."
+              openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
+                -out selfsigned.p12 -name "iPhone Developer: Temp User (123456)" \
+                -passout pass:123456 -legacy
+          else
+              echo "Using standard mode..."
+              openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
+                -out selfsigned.p12 -name "iPhone Developer: Temp User (123456)" \
+                -passout pass:123456
+          fi
           
-          # 导入到钥匙串
-          security import selfsigned.p12 -k build.keychain -P "" -T /usr/bin/codesign
+          # 3. 导入钥匙串 (关键：使用对应的密码 '123456')
+          security import selfsigned.p12 -k build.keychain -P "123456" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
           
           echo "✅ Certificate created and imported."
@@ -152,7 +161,7 @@ jobs:
               config.build_settings['ARCHS'] = 'arm64'
               config.build_settings['ONLY_ACTIVE_ARCH'] = 'NO'
               config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
-              # 允许 Xcode 使用我们刚才生成的自签名证书
+              # 启用签名，使用我们的自签名证书
               config.build_settings['CODE_SIGN_IDENTITY'] = 'iPhone Developer'
               config.build_settings['CODE_SIGNING_REQUIRED'] = 'YES'
               config.build_settings['CODE_SIGNING_ALLOWED'] = 'YES'
@@ -191,7 +200,7 @@ jobs:
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 16. 编译 Rust 静态库
+      # 16. 编译并合并静态库
       - name: Build and Merge Static Libs
         run: |
           echo "⚙️ Configuring iOS SDK..."
@@ -204,6 +213,8 @@ jobs:
           
           echo "📦 Merging libraries..."
           RUST_LIB=$(find target/aarch64-apple-ios/release -maxdepth 1 -name "lib*.a" | head -n 1)
+          if [ -z "$RUST_LIB" ]; then echo "❌ Rust lib not found"; exit 1; fi
+          
           VCPKG_LIB_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-ios/lib"
           mkdir -p flutter/ios/Runner
           libtool -static -o flutter/ios/Runner/librustdesk.a \
@@ -212,6 +223,7 @@ jobs:
             "$VCPKG_LIB_DIR"/libaom.a \
             "$VCPKG_LIB_DIR"/libvpx.a \
             "$VCPKG_LIB_DIR"/libyuv.a
+            
           echo "✅ Merged library created."
 
       # 17. 准备 Xcode 工程
@@ -226,18 +238,19 @@ jobs:
           # 注入工具链修复
           sed -i '' 's/ENABLE_BITCODE = NO;/ENABLE_BITCODE = NO; DT_TOOLCHAIN_DIR = "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain";/g' Runner.xcodeproj/project.pbxproj
           
-          # 设置签名 ID 为 "iPhone Developer" (匹配我们的自签名证书)
+          # 设置签名 ID 为 "iPhone Developer"
           sed -i '' 's/CODE_SIGNING_IDENTITY = ".*";/CODE_SIGNING_IDENTITY = "iPhone Developer";/g' Runner.xcodeproj/project.pbxproj
           
           # 强制允许签名
           sed -i '' 's/CODE_SIGNING_REQUIRED = NO/CODE_SIGNING_REQUIRED = YES/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = NO/CODE_SIGNING_ALLOWED = YES/g' Runner.xcodeproj/project.pbxproj
           
-          # 移除 Provisioning Profile (自签名不需要)
+          # 移除 Provisioning Profile
           sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
 
       # 19. 手动 Archive (带伪造签名)
+      # 添加 allowProvisioningUpdates 参数，尽管我们没有 profile，但这有时能抑制错误
       - name: Build Archive via Xcodebuild
         working-directory: ./flutter/ios
         run: |
@@ -253,13 +266,13 @@ jobs:
             CODE_SIGNING_REQUIRED=YES \
             CODE_SIGNING_ALLOWED=YES \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            DEVELOPMENT_TEAM="" || true
+            DEVELOPMENT_TEAM="" \
+            -allowProvisioningUpdates || true
             
-          # 检查结果
           if [ -d "Runner.xcarchive/Products/Applications/Runner.app" ]; then
              echo "✅ Archive success!"
           else
-             echo "❌ Archive failed. Check logs above."
+             echo "❌ Archive failed."
              exit 1
           fi
 
