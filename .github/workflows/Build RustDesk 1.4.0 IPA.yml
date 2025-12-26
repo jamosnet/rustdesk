@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V66)
+name: Build RustDesk 1.4.0 IPA (Final V66-Fixed)
 
 on:
   workflow_dispatch:
@@ -38,7 +38,7 @@ jobs:
           components: rustfmt
           targets: aarch64-apple-ios
 
-      # 3. Setup Flutter 3.19.6
+      # 3. Setup Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -58,7 +58,7 @@ jobs:
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs via VCPKG
+      # 6. 安装 iOS Libs
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
@@ -107,33 +107,36 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. 清理 Flutter
-      - name: Flutter Clean
-        working-directory: ./flutter
-        run: flutter clean
-
-      # 12. 【核心修复】Podfile 注入 (修复 Pods 编译)
-      - name: Inject Podfile Config
+      # 11. 【核心修复】Podfile 注入 (架构锁定 + 链接库)
+      - name: Inject Robust Podfile Config
         working-directory: ./flutter/ios
         run: |
+          echo "🔧 Patching Podfile..."
+          sed -i '' "s/platform :ios, .*/platform :ios, '13.0'/" Podfile
+
           python3 -c "
+          import re
           path = 'Podfile'
           with open(path, 'r') as f: content = f.read()
+          
           target_str = 'flutter_additional_ios_build_settings(target)'
           
-          # 关键：DT_TOOLCHAIN_DIR 修复 Xcode 15/16 找不到 libclang 的问题
+          # 强制 arm64，强制 Swift 5，修复工具链
           injection = \"\"\"
             flutter_additional_ios_build_settings(target)
             target.build_configurations.each do |config|
               config.build_settings['SWIFT_VERSION'] = '5.0'
               config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
               config.build_settings['ENABLE_BITCODE'] = 'NO'
+              config.build_settings['ARCHS'] = 'arm64'
+              config.build_settings['ONLY_ACTIVE_ARCH'] = 'NO'
+              config.build_settings['GCC_WARN_INHIBIT_ALL_WARNINGS'] = 'YES'
               config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
             end
           \"\"\"
           
-          if target_str in content:
-              new_content = content.replace(target_str, injection)
+          if re.search(r'(\s*flutter_additional_ios_build_settings\(target\))', content):
+              new_content = re.sub(r'(\s*flutter_additional_ios_build_settings\(target\))', injection, content)
               with open(path, 'w') as f: f.write(new_content)
               print('✅ Podfile patched.')
           else:
@@ -141,12 +144,14 @@ jobs:
               exit(1)
           "
 
-      # 13. Flutter Pub Get
-      - name: Install Flutter Dependencies
+      # 12. Flutter Clean & Pub Get
+      - name: Clean & Pub Get
         working-directory: ./flutter
-        run: flutter pub get
+        run: |
+          flutter clean
+          flutter pub get
 
-      # 14. 生成桥接代码
+      # 13. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -157,13 +162,13 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 15. Dart 补丁
+      # 14. Dart 补丁
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 16. 编译并合并静态库
+      # 15. 编译并合并静态库
       - name: Build and Merge Static Libs
         run: |
           echo "⚙️ Configuring iOS SDK..."
@@ -181,6 +186,7 @@ jobs:
           VCPKG_LIB_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-ios/lib"
           
           mkdir -p flutter/ios/Runner
+          
           libtool -static -o flutter/ios/Runner/librustdesk.a \
             "$RUST_LIB" \
             "$VCPKG_LIB_DIR"/libopus.a \
@@ -190,33 +196,36 @@ jobs:
             
           echo "✅ Merged library created."
 
-      # 17. 【核心修复】配置 Runner 工程 (解决主工程工具链问题)
+      # 16. 【核心修复】配置 Xcode 工程 (架构锁定 + 系统库链接)
       - name: Configure Xcode Project
         working-directory: ./flutter/ios
         run: |
           echo "🔧 Patching Runner.xcodeproj..."
-          # 1. 彻底禁用签名
+          # 1. 签名配置 (Ad-Hoc)
           sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/CODE_SIGNING_IDENTITY = ".*";/CODE_SIGNING_IDENTITY = "";/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
           
-          # 2. 注入 DT_TOOLCHAIN_DIR 到 Runner 目标 (解决主工程 libclang 报错)
-          # 在每个 Build Configuration 中追加设置
+          # 2. 注入 DT_TOOLCHAIN_DIR
           sed -i '' 's/ENABLE_BITCODE = NO;/ENABLE_BITCODE = NO; DT_TOOLCHAIN_DIR = "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain";/g' Runner.xcodeproj/project.pbxproj
           
           # 3. 强制升级 Deployment Target
           sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9]*\.[0-9]*;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' Runner.xcodeproj/project.pbxproj
+          
+          # 4. 【新增】强制锁定 ARCHS = arm64
+          # 防止 Xcode 试图构建 armv7 导致链接错误
+          sed -i '' 's/ARCHS = .*/ARCHS = arm64;/g' Runner.xcodeproj/project.pbxproj
 
-      # 18. 最终编译
+      # 17. 最终编译
       - name: Build IPA
         working-directory: ./flutter
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           flutter build ios --release --no-codesign --verbose
 
-      # 19. 打包上传
+      # 18. 打包上传
       - name: Package and Upload
         run: |
           mkdir Payload
