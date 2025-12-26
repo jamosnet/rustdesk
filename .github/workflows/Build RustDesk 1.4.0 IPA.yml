@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V70)
+name: Build RustDesk 1.4.0 IPA (Final V71)
 
 on:
   workflow_dispatch:
@@ -107,9 +107,8 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. 【核心修复】Podfile 强力注入 (全域免签)
-      # 遍历所有 Targets，强制置空 Team ID 并允许无签名
-      - name: Inject Podfile Global No-Sign
+      # 11. Podfile 注入 (只修 Pods，不修 Runner)
+      - name: Inject Podfile Config
         working-directory: ./flutter/ios
         run: |
           python3 -c "
@@ -118,50 +117,20 @@ jobs:
           with open(path, 'r') as f: content = f.read()
           
           target_str = 'flutter_additional_ios_build_settings(target)'
-          
-          # 这是一个超级 Hook，它会处理所有 Pod Targets
           injection = \"\"\"
             flutter_additional_ios_build_settings(target)
-            
-            # 主配置
             target.build_configurations.each do |config|
               config.build_settings['SWIFT_VERSION'] = '5.0'
               config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
               config.build_settings['ENABLE_BITCODE'] = 'NO'
-              config.build_settings['ARCHS'] = 'arm64'
-              config.build_settings['ONLY_ACTIVE_ARCH'] = 'NO'
               config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
-              
-              # 关键：禁用所有 Targets 的签名要求
-              config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
-              config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
-              config.build_settings['CODE_SIGN_IDENTITY'] = ''
-              config.build_settings['EXPANDED_CODE_SIGN_IDENTITY'] = ''
             end
           \"\"\"
           
-          # 还要在文件末尾追加一段，以防 post_install 没有覆盖到所有 Pods
-          # 但这里的注入点是标准的 flutter hook，通常能覆盖大部分
-          
           if re.search(r'(\s*flutter_additional_ios_build_settings\(target\))', content):
               new_content = re.sub(r'(\s*flutter_additional_ios_build_settings\(target\))', injection, content)
-              
-              # 在 post_install 的最后再加一层保险，遍历 installer.pods_project
-              extra_hook = \"\"\"
-              installer.pods_project.targets.each do |target|
-                target.build_configurations.each do |config|
-                  config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
-                  config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
-                  config.build_settings['CODE_SIGN_IDENTITY'] = ''
-                  config.build_settings['EXPANDED_CODE_SIGN_IDENTITY'] = ''
-                  config.build_settings['DEVELOPMENT_TEAM'] = ''
-                end
-              end
-              \"\"\"
-              # 找到 post_install 的结束位置 'end' 之前插入 (这比较难正则，简单点直接依赖上面的注入通常够了，或者追加到最后)
-              
               with open(path, 'w') as f: f.write(new_content)
-              print('✅ Podfile patched with Global No-Sign.')
+              print('✅ Podfile patched.')
           else:
               exit(1)
           "
@@ -213,40 +182,34 @@ jobs:
             "$VCPKG_LIB_DIR"/libaom.a \
             "$VCPKG_LIB_DIR"/libvpx.a \
             "$VCPKG_LIB_DIR"/libyuv.a
+            
           echo "✅ Merged library created."
 
-      # 16. 配置 Xcode (Runner 免签)
-      - name: Configure Xcode Project
-        working-directory: ./flutter/ios
-        run: |
-          sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/CODE_SIGNING_IDENTITY = ".*";/CODE_SIGNING_IDENTITY = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
-          # 确保其他 Target 也被修改 (暴力替换所有 YES 为 NO 对于 CODE_SIGNING 是安全的)
-          sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
-
-      # 17. 准备 Xcode 工程
+      # 16. 准备 Xcode 工程
       - name: Prepare Xcode Project
         working-directory: ./flutter
         run: flutter build ios --config-only
 
-      # 18. 手动 Archive (允许无签名)
+      # 17. 【核心修复】Ad-Hoc 签名归档
+      # 不再禁用签名，而是使用 "-" (Ad-Hoc) 签名，这通常能让脚本跑通
       - name: Build Archive via Xcodebuild
         working-directory: ./flutter/ios
         run: |
-          echo "🚀 Starting xcodebuild archive..."
+          echo "🚀 Starting xcodebuild archive (Ad-Hoc Mode)..."
+          
+          # CODE_SIGNING_ALLOWED=YES (关键)
+          # CODE_SIGN_IDENTITY="-" (关键：表示 Ad-Hoc 签名)
+          # CODE_SIGNING_REQUIRED=NO (允许无 Profile)
           xcodebuild archive \
             -workspace Runner.xcworkspace \
             -scheme Runner \
             -configuration Release \
             -sdk iphoneos \
             -archivePath Runner.xcarchive \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            EXPANDED_CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
             -allowProvisioningUpdates || true
             
           if [ -d "Runner.xcarchive/Products/Applications/Runner.app" ]; then
@@ -256,7 +219,7 @@ jobs:
              exit 1
           fi
 
-      # 19. 提取并打包
+      # 18. 提取并打包
       - name: Export IPA
         working-directory: ./flutter/ios
         run: |
@@ -265,7 +228,7 @@ jobs:
           zip -r RustDesk_1.4.0_Unsigned.ipa Payload
           echo "✅ IPA created successfully."
 
-      # 20. 上传
+      # 19. 上传
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
