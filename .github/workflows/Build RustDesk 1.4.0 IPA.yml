@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V75)
+name: Build RustDesk 1.4.0 IPA (Final V76)
 
 on:
   workflow_dispatch:
@@ -102,13 +102,12 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 10. 安装 Codegen (1.80.1)
+      # 10. 安装 Codegen
       - name: Install Bridge Codegen
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. 【核心修复】创建兼容版自签名证书
-      # 使用 OpenSSL 3 兼容参数生成旧版 P12，解决 MAC verification failed
+      # 11. 创建自签名证书 (Legacy Mode)
       - name: Create & Trust Fake Certificate
         run: |
           echo "🔐 Creating Keychain..."
@@ -118,31 +117,25 @@ jobs:
           security unlock-keychain -p "123456" build.keychain
           
           echo "🔐 Generating Certificate..."
-          # 1. 生成 Key/CRT
           openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
             -keyout selfsigned.key -out selfsigned.crt \
             -subj "/CN=iPhone Developer/C=US"
           
-          # 2. 导出 P12 (尝试使用 legacy 参数)
-          # 如果 openssl 版本支持 -legacy 则使用，否则使用指定算法
           if openssl pkcs12 -help 2>&1 | grep -q "legacy"; then
               echo "Using legacy mode..."
               openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
                 -out selfsigned.p12 -name "iPhone Developer" \
                 -passout pass:123456 -legacy
           else
-              echo "Using algorithm explicit mode..."
+              echo "Using standard mode..."
               openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
                 -out selfsigned.p12 -name "iPhone Developer" \
                 -passout pass:123456 \
                 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
           fi
           
-          # 3. 导入钥匙串
-          echo "Importing p12..."
           security import selfsigned.p12 -k build.keychain -P "123456" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "123456" build.keychain
-          
           echo "✅ Certificate ready."
 
       # 12. Podfile 注入
@@ -163,17 +156,12 @@ jobs:
               config.build_settings['ENABLE_BITCODE'] = 'NO'
               config.build_settings['ARCHS'] = 'arm64'
               config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
-              # 关键：开启签名，使用我们的假证书
-              config.build_settings['CODE_SIGN_IDENTITY'] = 'iPhone Developer'
-              config.build_settings['CODE_SIGNING_REQUIRED'] = 'YES'
-              config.build_settings['CODE_SIGNING_ALLOWED'] = 'YES'
             end
           \"\"\"
           
           if re.search(r'(\s*flutter_additional_ios_build_settings\(target\))', content):
               new_content = re.sub(r'(\s*flutter_additional_ios_build_settings\(target\))', injection, content)
               with open(path, 'w') as f: f.write(new_content)
-              print('✅ Podfile patched.')
           else:
               exit(1)
           "
@@ -210,13 +198,9 @@ jobs:
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
-          echo "🚀 Compiling Rust..."
           cargo build --target aarch64-apple-ios --release --jobs 1 -p rustdesk --lib --features flutter
           
-          echo "📦 Merging libraries..."
           RUST_LIB=$(find target/aarch64-apple-ios/release -maxdepth 1 -name "lib*.a" | head -n 1)
-          if [ -z "$RUST_LIB" ]; then echo "❌ Rust lib not found"; exit 1; fi
-          
           VCPKG_LIB_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-ios/lib"
           mkdir -p flutter/ios/Runner
           libtool -static -o flutter/ios/Runner/librustdesk.a \
@@ -232,33 +216,33 @@ jobs:
         working-directory: ./flutter
         run: flutter build ios --config-only
 
-      # 18. 配置 Xcode (使用假证书)
-      - name: Configure Xcode Project
+      # 18. 【核心修复】物理替换签名设置 (覆盖所有 Project 文件)
+      # 遍历 Pods.xcodeproj 和 Runner.xcodeproj，强制统一签名配置
+      - name: Force Patch Xcode Projects
         working-directory: ./flutter/ios
         run: |
-          # 注入工具链修复 & 启用签名
-          sed -i '' 's/ENABLE_BITCODE = NO;/ENABLE_BITCODE = NO; DT_TOOLCHAIN_DIR = "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain";/g' Runner.xcodeproj/project.pbxproj
+          echo "🔧 Patching all .pbxproj files..."
+          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/CODE_SIGNING_ALLOWED = NO/CODE_SIGNING_ALLOWED = YES/g'
+          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/CODE_SIGNING_REQUIRED = NO/CODE_SIGNING_REQUIRED = YES/g'
           
-          # 设置签名 ID
-          sed -i '' 's/CODE_SIGNING_IDENTITY = ".*";/CODE_SIGNING_IDENTITY = "iPhone Developer";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/"CODE_SIGNING_IDENTITY\[sdk=iphoneos\*\]" = ".*";/"CODE_SIGNING_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";/g' Runner.xcodeproj/project.pbxproj
+          # 强制替换 Development Team 为空
+          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/DEVELOPMENT_TEAM = [A-Z0-9]*;/DEVELOPMENT_TEAM = "";/g'
           
-          # 强制允许签名
-          sed -i '' 's/CODE_SIGNING_REQUIRED = NO/CODE_SIGNING_REQUIRED = YES/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/CODE_SIGNING_ALLOWED = NO/CODE_SIGNING_ALLOWED = YES/g' Runner.xcodeproj/project.pbxproj
+          # 强制替换签名 ID 为 "iPhone Developer"
+          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/CODE_SIGN_IDENTITY = ".*";/CODE_SIGN_IDENTITY = "iPhone Developer";/g'
+          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = ".*";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";/g'
           
-          # 移除 Profile (自签名不需要)
-          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
+          # 清除 Profile
+          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g'
+          
+          echo "✅ All projects patched with fake signing."
 
-      # 19. 【核心】Fake Signed Build
+      # 19. Build (Fake Signed)
       - name: Build App via Xcodebuild
         working-directory: ./flutter/ios
         run: |
-          echo "🚀 Starting xcodebuild (Fake Signed)..."
+          echo "🚀 Starting xcodebuild build..."
           
-          # 使用 build 命令 (不是 archive)
-          # 指定 CODE_SIGN_IDENTITY="iPhone Developer"
           xcodebuild build \
             -workspace Runner.xcworkspace \
             -scheme Runner \
@@ -271,13 +255,10 @@ jobs:
             -derivedDataPath build \
             -allowProvisioningUpdates || true
             
-          # 查找生成的 .app
           APP_DIR=$(find build -name "Runner.app" | head -n 1)
           
           if [ -n "$APP_DIR" ] && [ -d "$APP_DIR" ]; then
              echo "✅ Build success! Found at $APP_DIR"
-             
-             # 检查二进制文件是否存在 (防止空包)
              if [ -f "$APP_DIR/Runner" ]; then
                  echo "✅ Binary verified."
                  mkdir Payload
