@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V76)
+name: Build RustDesk 1.4.0 IPA (Final V73)
 
 on:
   workflow_dispatch:
@@ -107,38 +107,7 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. 创建自签名证书 (Legacy Mode)
-      - name: Create & Trust Fake Certificate
-        run: |
-          echo "🔐 Creating Keychain..."
-          security create-keychain -p "123456" build.keychain
-          security list-keychains -s build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "123456" build.keychain
-          
-          echo "🔐 Generating Certificate..."
-          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout selfsigned.key -out selfsigned.crt \
-            -subj "/CN=iPhone Developer/C=US"
-          
-          if openssl pkcs12 -help 2>&1 | grep -q "legacy"; then
-              echo "Using legacy mode..."
-              openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
-                -out selfsigned.p12 -name "iPhone Developer" \
-                -passout pass:123456 -legacy
-          else
-              echo "Using standard mode..."
-              openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
-                -out selfsigned.p12 -name "iPhone Developer" \
-                -passout pass:123456 \
-                -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
-          fi
-          
-          security import selfsigned.p12 -k build.keychain -P "123456" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "123456" build.keychain
-          echo "✅ Certificate ready."
-
-      # 12. Podfile 注入
+      # 11. Podfile 注入
       - name: Inject Podfile Config
         working-directory: ./flutter/ios
         run: |
@@ -147,6 +116,9 @@ jobs:
           path = 'Podfile'
           with open(path, 'r') as f: content = f.read()
           
+          # 升级平台
+          content = re.sub(r'platform :ios, .*', \"platform :ios, '13.0'\", content)
+
           target_str = 'flutter_additional_ios_build_settings(target)'
           injection = \"\"\"
             flutter_additional_ios_build_settings(target)
@@ -155,25 +127,29 @@ jobs:
               config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
               config.build_settings['ENABLE_BITCODE'] = 'NO'
               config.build_settings['ARCHS'] = 'arm64'
+              config.build_settings['ONLY_ACTIVE_ARCH'] = 'NO'
               config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
+              config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
+              config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
             end
           \"\"\"
           
           if re.search(r'(\s*flutter_additional_ios_build_settings\(target\))', content):
               new_content = re.sub(r'(\s*flutter_additional_ios_build_settings\(target\))', injection, content)
               with open(path, 'w') as f: f.write(new_content)
+              print('✅ Podfile patched.')
           else:
               exit(1)
           "
 
-      # 13. Flutter Clean & Pub Get
+      # 12. Flutter Clean & Pub Get
       - name: Flutter Clean & Pub Get
         working-directory: ./flutter
         run: |
           flutter clean
           flutter pub get
 
-      # 14. 生成桥接代码
+      # 13. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -184,13 +160,13 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 15. Dart 补丁
+      # 14. Dart 补丁
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 16. 编译并合并静态库
+      # 15. 编译并合并静态库
       - name: Build and Merge Static Libs
         run: |
           echo "⚙️ Configuring iOS SDK..."
@@ -198,9 +174,13 @@ jobs:
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK_PATH --target=arm64-apple-ios"
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
+          echo "🚀 Compiling Rust..."
           cargo build --target aarch64-apple-ios --release --jobs 1 -p rustdesk --lib --features flutter
           
+          echo "📦 Merging libraries..."
           RUST_LIB=$(find target/aarch64-apple-ios/release -maxdepth 1 -name "lib*.a" | head -n 1)
+          if [ -z "$RUST_LIB" ]; then echo "❌ Rust lib not found"; exit 1; fi
+          
           VCPKG_LIB_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-ios/lib"
           mkdir -p flutter/ios/Runner
           libtool -static -o flutter/ios/Runner/librustdesk.a \
@@ -211,70 +191,66 @@ jobs:
             "$VCPKG_LIB_DIR"/libyuv.a
           echo "✅ Merged library created."
 
+      # 16. 修改 Xcode 主工程设置 (禁用签名)
+      - name: Configure Xcode Project
+        working-directory: ./flutter/ios
+        run: |
+          sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGNING_IDENTITY = ".*";/CODE_SIGNING_IDENTITY = "";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/ENABLE_BITCODE = NO;/ENABLE_BITCODE = NO; DT_TOOLCHAIN_DIR = "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9]*\.[0-9]*;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/ARCHS = .*/ARCHS = arm64;/g' Runner.xcodeproj/project.pbxproj
+
       # 17. 准备 Xcode 工程
       - name: Prepare Xcode Project
         working-directory: ./flutter
         run: flutter build ios --config-only
 
-      # 18. 【核心修复】物理替换签名设置 (覆盖所有 Project 文件)
-      # 遍历 Pods.xcodeproj 和 Runner.xcodeproj，强制统一签名配置
-      - name: Force Patch Xcode Projects
+      # 18. 【核心大招】Build Archive & 暴力提取
+      - name: Build Archive via Xcodebuild
         working-directory: ./flutter/ios
         run: |
-          echo "🔧 Patching all .pbxproj files..."
-          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/CODE_SIGNING_ALLOWED = NO/CODE_SIGNING_ALLOWED = YES/g'
-          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/CODE_SIGNING_REQUIRED = NO/CODE_SIGNING_REQUIRED = YES/g'
-          
-          # 强制替换 Development Team 为空
-          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/DEVELOPMENT_TEAM = [A-Z0-9]*;/DEVELOPMENT_TEAM = "";/g'
-          
-          # 强制替换签名 ID 为 "iPhone Developer"
-          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/CODE_SIGN_IDENTITY = ".*";/CODE_SIGN_IDENTITY = "iPhone Developer";/g'
-          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = ".*";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";/g'
-          
-          # 清除 Profile
-          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g'
-          
-          echo "✅ All projects patched with fake signing."
-
-      # 19. Build (Fake Signed)
-      - name: Build App via Xcodebuild
-        working-directory: ./flutter/ios
-        run: |
-          echo "🚀 Starting xcodebuild build..."
-          
-          xcodebuild build \
+          echo "🚀 Starting xcodebuild archive..."
+          xcodebuild archive \
             -workspace Runner.xcworkspace \
             -scheme Runner \
             -configuration Release \
             -sdk iphoneos \
-            CODE_SIGN_IDENTITY="iPhone Developer" \
-            CODE_SIGNING_REQUIRED=YES \
-            CODE_SIGNING_ALLOWED=YES \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            -derivedDataPath build \
+            -archivePath Runner.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
             -allowProvisioningUpdates || true
             
-          APP_DIR=$(find build -name "Runner.app" | head -n 1)
+          echo "🔍 Searching for App Bundle..."
           
-          if [ -n "$APP_DIR" ] && [ -d "$APP_DIR" ]; then
-             echo "✅ Build success! Found at $APP_DIR"
-             if [ -f "$APP_DIR/Runner" ]; then
-                 echo "✅ Binary verified."
-                 mkdir Payload
-                 cp -r "$APP_DIR" Payload/
-                 zip -r RustDesk_1.4.0_Unsigned.ipa Payload
-                 echo "✅ IPA created."
-             else
-                 echo "❌ Binary missing in .app bundle!"
-                 exit 1
-             fi
+          # 策略A: 从 Archive 中找
+          APP_PATH="Runner.xcarchive/Products/Applications/Runner.app"
+          
+          # 策略B: 如果 A 失败，全盘搜索 build 目录 (因为我们用了 derivedDataPath 或者是默认路径)
+          if [ ! -d "$APP_PATH" ]; then
+              echo "⚠️ Archive path empty, searching derived data..."
+              APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "Runner.app" | grep "Release-iphoneos" | head -n 1)
+          fi
+          
+          if [ -d "$APP_PATH" ]; then
+             echo "✅ Found App at: $APP_PATH"
+             mkdir Payload
+             cp -r "$APP_PATH" Payload/
+             zip -r RustDesk_1.4.0_Unsigned.ipa Payload
+             echo "✅ IPA created successfully."
           else
-             echo "❌ Build failed. App not found."
+             echo "❌ Absolute failure. No Runner.app found anywhere."
+             # 列出所有可能目录帮助调试
+             find . -maxdepth 4 -name "*.app"
              exit 1
           fi
 
-      # 20. 上传
+      # 19. 上传
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
