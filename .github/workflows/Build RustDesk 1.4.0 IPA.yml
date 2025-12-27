@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V75)
+name: Build RustDesk 1.4.0 IPA (Final V99)
 
 on:
   workflow_dispatch:
@@ -58,7 +58,7 @@ jobs:
         run: |
           cargo install cargo-lipo --locked
 
-      # 6. 安装 iOS Libs
+      # 6. 安装 iOS Libs via VCPKG
       - name: Install iOS Libs via VCPKG
         run: |
           echo "⚙️ Setting up vcpkg..."
@@ -107,7 +107,7 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. Podfile 注入
+      # 11. Podfile 强力修复 (禁用签名 + 修复路径)
       - name: Inject Podfile Config
         working-directory: ./flutter/ios
         run: |
@@ -116,7 +116,7 @@ jobs:
           path = 'Podfile'
           with open(path, 'r') as f: content = f.read()
           
-          # 升级平台
+          # 升级平台到 13.0
           content = re.sub(r'platform :ios, .*', \"platform :ios, '13.0'\", content)
 
           target_str = 'flutter_additional_ios_build_settings(target)'
@@ -127,11 +127,12 @@ jobs:
               config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
               config.build_settings['ENABLE_BITCODE'] = 'NO'
               config.build_settings['ARCHS'] = 'arm64'
-              config.build_settings['ONLY_ACTIVE_ARCH'] = 'NO'
               config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
-              # 禁用签名检查
+              # 禁用签名
               config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
               config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
+              config.build_settings['CODE_SIGN_IDENTITY'] = ''
+              config.build_settings['EXPANDED_CODE_SIGN_IDENTITY'] = ''
             end
           \"\"\"
           
@@ -167,7 +168,7 @@ jobs:
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 15. 编译并合并静态库
+      # 15. 编译并合并静态库 (VCPKG + Rust)
       - name: Build and Merge Static Libs
         run: |
           echo "⚙️ Configuring iOS SDK..."
@@ -176,6 +177,7 @@ jobs:
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
           
           echo "🚀 Compiling Rust..."
+          # --features flutter 是必须的
           cargo build --target aarch64-apple-ios --release --jobs 1 -p rustdesk --lib --features flutter
           
           echo "📦 Merging libraries..."
@@ -183,6 +185,7 @@ jobs:
           if [ -z "$RUST_LIB" ]; then echo "❌ Rust lib not found"; exit 1; fi
           
           VCPKG_LIB_DIR="$VCPKG_INSTALLATION_ROOT/installed/arm64-ios/lib"
+          
           mkdir -p flutter/ios/Runner
           libtool -static -o flutter/ios/Runner/librustdesk.a \
             "$RUST_LIB" \
@@ -190,75 +193,22 @@ jobs:
             "$VCPKG_LIB_DIR"/libaom.a \
             "$VCPKG_LIB_DIR"/libvpx.a \
             "$VCPKG_LIB_DIR"/libyuv.a
+            
           echo "✅ Merged library created."
 
       # 16. 修改 Xcode 主工程设置 (禁用签名)
       - name: Configure Xcode Project
         working-directory: ./flutter/ios
         run: |
-          sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/CODE_SIGNING_IDENTITY = ".*";/CODE_SIGNING_IDENTITY = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/ENABLE_BITCODE = NO;/ENABLE_BITCODE = NO; DT_TOOLCHAIN_DIR = "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9]*\.[0-9]*;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/ARCHS = .*/ARCHS = arm64;/g' Runner.xcodeproj/project.pbxproj
+          # 暴力替换所有签名设置为 NO
+          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g'
+          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g'
+          find . -name "project.pbxproj" -print0 | xargs -0 sed -i '' 's/CODE_SIGNING_IDENTITY = ".*"/CODE_SIGNING_IDENTITY = ""/g'
 
-      # 17. 准备 Xcode 工程 (Pod Install)
-      - name: Prepare Xcode Project
+      # 17. 【核心大招】Flutter Build + 强行提取
+      - name: Build and Extract (Ignore Errors)
         working-directory: ./flutter
-        run: flutter build ios --config-only
-
-      # 18. 【核心大招】Build Only & 强行提取
-      - name: Build App via Xcodebuild
-        working-directory: ./flutter/ios
         run: |
-          echo "🚀 Starting xcodebuild build (Build Only)..."
+          echo "🚀 Building Flutter app (ignoring sign errors)..."
           
-          # 使用 build 命令，忽略错误
-          xcodebuild build \
-            -workspace Runner.xcworkspace \
-            -scheme Runner \
-            -configuration Release \
-            -sdk iphoneos \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            EXPANDED_CODE_SIGN_IDENTITY="" \
-            -derivedDataPath build || true
-            
-          echo "🔍 Searching for Generated App..."
-          # 搜索 build 目录下的所有 .app
-          APP_PATHS=$(find build -name "Runner.app")
-          echo "Found apps: $APP_PATHS"
-          
-          # 取第一个 Release-iphoneos 下的产物
-          TARGET_APP=$(echo "$APP_PATHS" | grep "Release-iphoneos" | head -n 1)
-          
-          if [ -z "$TARGET_APP" ]; then
-              # 如果没有 Release 的，就找任意一个
-              TARGET_APP=$(echo "$APP_PATHS" | head -n 1)
-          fi
-          
-          if [ -n "$TARGET_APP" ] && [ -d "$TARGET_APP" ]; then
-             echo "✅ Build success! Found at $TARGET_APP"
-             
-             mkdir Payload
-             cp -r "$TARGET_APP" Payload/
-             zip -r RustDesk_1.4.0_Unsigned.ipa Payload
-             echo "✅ IPA created successfully."
-          else
-             echo "❌ Build failed. No Runner.app found."
-             # 列出目录结构帮助调试
-             ls -R build || true
-             exit 1
-          fi
-
-      # 19. 上传
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: RustDesk-1.4.0-Unsigned-IPA
-          path: flutter/ios/RustDesk_1.4.0_Unsigned.ipa
-          retention-days: 3
+          # 使用 flutter build
