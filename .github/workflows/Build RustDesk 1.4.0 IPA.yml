@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V73)
+name: Build RustDesk 1.4.0 IPA (Final V80)
 
 on:
   workflow_dispatch:
@@ -102,12 +102,40 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 10. 安装 Codegen
+      # 10. 安装 Codegen (1.80.1)
       - name: Install Bridge Codegen
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. Podfile 注入
+      # 11. 【关键】创建并信任伪造证书
+      - name: Setup Fake Signing Identity
+        run: |
+          echo "🔐 Creating Keychain..."
+          security create-keychain -p "123456" build.keychain
+          security list-keychains -s build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "123456" build.keychain
+          
+          echo "🔐 Generating Self-Signed Certificate..."
+          # 1. 生成 Key
+          openssl genrsa -out selfsigned.key 2048
+          # 2. 生成 CSR
+          openssl req -new -key selfsigned.key -out selfsigned.csr -subj "/CN=iPhone Developer/C=US"
+          # 3. 生成 CRT
+          openssl x509 -req -days 365 -in selfsigned.csr -signkey selfsigned.key -out selfsigned.crt
+          
+          # 4. 导出 P12 (使用最兼容的算法，防止 'MAC verification failed')
+          openssl pkcs12 -export -out selfsigned.p12 -inkey selfsigned.key -in selfsigned.crt \
+            -passout pass:123456 \
+            -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+          
+          echo "🔐 Importing to Keychain..."
+          security import selfsigned.p12 -k build.keychain -P "123456" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "123456" build.keychain
+          
+          echo "✅ Fake 'iPhone Developer' identity ready."
+
+      # 12. Podfile 注入
       - name: Inject Podfile Config
         working-directory: ./flutter/ios
         run: |
@@ -116,9 +144,6 @@ jobs:
           path = 'Podfile'
           with open(path, 'r') as f: content = f.read()
           
-          # 升级平台
-          content = re.sub(r'platform :ios, .*', \"platform :ios, '13.0'\", content)
-
           target_str = 'flutter_additional_ios_build_settings(target)'
           injection = \"\"\"
             flutter_additional_ios_build_settings(target)
@@ -127,10 +152,11 @@ jobs:
               config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
               config.build_settings['ENABLE_BITCODE'] = 'NO'
               config.build_settings['ARCHS'] = 'arm64'
-              config.build_settings['ONLY_ACTIVE_ARCH'] = 'NO'
               config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
-              config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
-              config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
+              # 使用我们的假证书
+              config.build_settings['CODE_SIGN_IDENTITY'] = 'iPhone Developer'
+              config.build_settings['CODE_SIGNING_REQUIRED'] = 'YES'
+              config.build_settings['CODE_SIGNING_ALLOWED'] = 'YES'
             end
           \"\"\"
           
@@ -142,14 +168,14 @@ jobs:
               exit(1)
           "
 
-      # 12. Flutter Clean & Pub Get
+      # 13. Flutter Clean & Pub Get
       - name: Flutter Clean & Pub Get
         working-directory: ./flutter
         run: |
           flutter clean
           flutter pub get
 
-      # 13. 生成桥接代码
+      # 14. 生成桥接代码
       - name: Generate Bridge
         run: |
           export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:$PATH"
@@ -160,13 +186,13 @@ jobs:
             --c-output flutter/ios/Runner/bridge_generated.h \
             --class-name RustdeskImpl
 
-      # 14. Dart 补丁
+      # 15. Dart 补丁
       - name: Patch Generated Bridge Code
         working-directory: ./flutter/lib
         run: |
           sed -i '' 's/abstract class RustdeskImpl/class RustdeskImpl/g' generated_bridge.dart
 
-      # 15. 编译并合并静态库
+      # 16. 编译并合并静态库
       - name: Build and Merge Static Libs
         run: |
           echo "⚙️ Configuring iOS SDK..."
@@ -191,66 +217,69 @@ jobs:
             "$VCPKG_LIB_DIR"/libyuv.a
           echo "✅ Merged library created."
 
-      # 16. 修改 Xcode 主工程设置 (禁用签名)
-      - name: Configure Xcode Project
-        working-directory: ./flutter/ios
-        run: |
-          sed -i '' 's/CODE_SIGNING_REQUIRED = YES/CODE_SIGNING_REQUIRED = NO/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/CODE_SIGNING_ALLOWED = YES/CODE_SIGNING_ALLOWED = NO/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/CODE_SIGNING_IDENTITY = ".*";/CODE_SIGNING_IDENTITY = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/ENABLE_BITCODE = NO;/ENABLE_BITCODE = NO; DT_TOOLCHAIN_DIR = "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain";/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9]*\.[0-9]*;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' Runner.xcodeproj/project.pbxproj
-          sed -i '' 's/ARCHS = .*/ARCHS = arm64;/g' Runner.xcodeproj/project.pbxproj
-
       # 17. 准备 Xcode 工程
       - name: Prepare Xcode Project
         working-directory: ./flutter
         run: flutter build ios --config-only
 
-      # 18. 【核心大招】Build Archive & 暴力提取
-      - name: Build Archive via Xcodebuild
+      # 18. 配置 Xcode (使用假证书)
+      - name: Configure Xcode Project
         working-directory: ./flutter/ios
         run: |
-          echo "🚀 Starting xcodebuild archive..."
-          xcodebuild archive \
+          # 1. 强制使用我们导入的证书 'iPhone Developer'
+          sed -i '' 's/CODE_SIGN_IDENTITY = ".*";/CODE_SIGN_IDENTITY = "iPhone Developer";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = ".*";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";/g' Runner.xcodeproj/project.pbxproj
+          
+          # 2. 开启签名 (这是为了欺骗 Xcode 让他去打包)
+          sed -i '' 's/CODE_SIGNING_REQUIRED = NO/CODE_SIGNING_REQUIRED = YES/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGNING_ALLOWED = NO/CODE_SIGNING_ALLOWED = YES/g' Runner.xcodeproj/project.pbxproj
+          
+          # 3. 清空 Profile UUID (自签名不需要这个)
+          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
+
+      # 19. 【关键】执行 Build (生成 .app)
+      - name: Build App (NOT Archive)
+        working-directory: ./flutter/ios
+        run: |
+          echo "🚀 Starting xcodebuild build..."
+          
+          # 使用 build 命令，而不是 archive
+          # 这样可以避开 Archive 阶段极其严格的 Entitlements 检查
+          xcodebuild build \
             -workspace Runner.xcworkspace \
             -scheme Runner \
             -configuration Release \
             -sdk iphoneos \
-            -archivePath Runner.xcarchive \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            EXPANDED_CODE_SIGN_IDENTITY="" \
-            -allowProvisioningUpdates || true
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="iPhone Developer" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            -allowProvisioningUpdates
             
-          echo "🔍 Searching for App Bundle..."
-          
-          # 策略A: 从 Archive 中找
-          APP_PATH="Runner.xcarchive/Products/Applications/Runner.app"
-          
-          # 策略B: 如果 A 失败，全盘搜索 build 目录 (因为我们用了 derivedDataPath 或者是默认路径)
-          if [ ! -d "$APP_PATH" ]; then
-              echo "⚠️ Archive path empty, searching derived data..."
-              APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "Runner.app" | grep "Release-iphoneos" | head -n 1)
-          fi
+          # 搜寻产物 (Build 成功后，产物在 derivedData/Build/Products/Release-iphoneos/Runner.app)
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -name "Runner.app" | head -n 1)
           
           if [ -d "$APP_PATH" ]; then
-             echo "✅ Found App at: $APP_PATH"
-             mkdir Payload
-             cp -r "$APP_PATH" Payload/
-             zip -r RustDesk_1.4.0_Unsigned.ipa Payload
-             echo "✅ IPA created successfully."
+             echo "✅ Build success! App found at $APP_PATH"
+             
+             # 验证二进制文件
+             if [ -f "$APP_PATH/Runner" ]; then
+                mkdir Payload
+                cp -r "$APP_PATH" Payload/
+                zip -r RustDesk_1.4.0_Unsigned.ipa Payload
+                echo "✅ IPA created (Size: $(ls -lh RustDesk_1.4.0_Unsigned.ipa | awk '{print $5}'))"
+             else
+                echo "❌ Error: Runner binary missing inside .app"
+                exit 1
+             fi
           else
-             echo "❌ Absolute failure. No Runner.app found anywhere."
-             # 列出所有可能目录帮助调试
-             find . -maxdepth 4 -name "*.app"
+             echo "❌ Build failed. Runner.app not found."
              exit 1
           fi
 
-      # 19. 上传
+      # 20. 上传
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
