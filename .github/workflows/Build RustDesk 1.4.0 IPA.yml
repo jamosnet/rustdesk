@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V106)
+name: Build RustDesk 1.4.0 IPA (Final V107)
 
 on:
   workflow_dispatch:
@@ -107,67 +107,79 @@ jobs:
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. 【关键】创建并信任伪造证书
+      # 11. 创建自签名证书
       - name: Setup Fake Signing Identity
         run: |
-          echo "🔐 Creating Keychain..."
           security create-keychain -p "123456" build.keychain
           security list-keychains -s build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "123456" build.keychain
-          
-          echo "🔐 Generating Self-Signed Certificate..."
           openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
             -keyout selfsigned.key -out selfsigned.crt \
             -subj "/CN=iPhone Developer/C=US"
-          
-          # 使用兼容参数导出 P12 (Fix MAC verification failed)
-          openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
-            -out selfsigned.p12 -name "iPhone Developer" \
-            -passout pass:123456 \
-            -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
-          
-          echo "🔐 Importing to Keychain..."
+          if openssl pkcs12 -help 2>&1 | grep -q "legacy"; then
+              openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
+                -out selfsigned.p12 -name "iPhone Developer" \
+                -passout pass:123456 -legacy
+          else
+              openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
+                -out selfsigned.p12 -name "iPhone Developer" \
+                -passout pass:123456 \
+                -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+          fi
           security import selfsigned.p12 -k build.keychain -P "123456" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "123456" build.keychain
-          
-          echo "✅ Fake 'iPhone Developer' identity ready."
 
-      # 12. Podfile 注入
-      - name: Inject Podfile Config
+      # 12. 【核心修复】安全注入 Podfile (避免重复钩子)
+      - name: Inject Podfile Config Safely
         working-directory: ./flutter/ios
         run: |
+          # 先还原，防止脏数据
+          git checkout Podfile || true
+          
           python3 -c "
-          import re
           path = 'Podfile'
           with open(path, 'r') as f: content = f.read()
           
-          target_str = 'flutter_additional_ios_build_settings(target)'
-          injection = \"\"\"
-            flutter_additional_ios_build_settings(target)
-            target.build_configurations.each do |config|
-              config.build_settings['SWIFT_VERSION'] = '5.0'
-              config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
-              config.build_settings['ENABLE_BITCODE'] = 'NO'
-              config.build_settings['ARCHS'] = 'arm64'
-              config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
-              
-              # 强制使用 Manual 签名模式
-              config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
-              config.build_settings['CODE_SIGN_IDENTITY'] = 'iPhone Developer'
-              config.build_settings['CODE_SIGNING_REQUIRED'] = 'YES'
-              config.build_settings['CODE_SIGNING_ALLOWED'] = 'YES'
-              config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = ''
-              config.build_settings['DEVELOPMENT_TEAM'] = ''
-            end
+          # 要注入的配置代码
+          config_code = \"\"\"
+              target.build_configurations.each do |config|
+                config.build_settings['SWIFT_VERSION'] = '5.0'
+                config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
+                config.build_settings['ENABLE_BITCODE'] = 'NO'
+                config.build_settings['ARCHS'] = 'arm64'
+                config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
+                config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
+                config.build_settings['CODE_SIGN_IDENTITY'] = 'iPhone Developer'
+                config.build_settings['CODE_SIGNING_REQUIRED'] = 'YES'
+                config.build_settings['CODE_SIGNING_ALLOWED'] = 'YES'
+                config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = ''
+                config.build_settings['DEVELOPMENT_TEAM'] = ''
+              end
           \"\"\"
           
-          if re.search(r'(\s*flutter_additional_ios_build_settings\(target\))', content):
-              new_content = re.sub(r'(\s*flutter_additional_ios_build_settings\(target\))', injection, content)
+          # 尝试找到 flutter 默认钩子进行替换
+          target_str = 'flutter_additional_ios_build_settings(target)'
+          
+          if target_str in content:
+              print('✅ Found standard hook point. Injecting...')
+              # 在 flutter_additional_ios_build_settings(target) 后面加上我们的配置
+              replacement = target_str + '\\n' + config_code
+              new_content = content.replace(target_str, replacement)
               with open(path, 'w') as f: f.write(new_content)
-              print('✅ Podfile patched.')
+              
+          elif 'post_install do |installer|' in content:
+              print('⚠️ Standard hook not found, injecting into post_install root...')
+              # 尝试插入到 post_install 的第一行后面
+              replacement = 'post_install do |installer|\\n  installer.pods_project.targets.each do |target|\\n' + config_code + '\\n  end'
+              new_content = content.replace('post_install do |installer|', replacement)
+              with open(path, 'w') as f: f.write(new_content)
+              
           else:
-              exit(1)
+              print('❌ Fatal: No valid injection point found in Podfile!')
+              print('--- Podfile Content ---')
+              print(content)
+              exit(1) # 强制失败，不再盲目追加
           "
 
       # 13. Flutter Clean & Pub Get
@@ -224,12 +236,11 @@ jobs:
         working-directory: ./flutter
         run: flutter build ios --config-only
 
-      # 18. 【核心修复】修改 Project 文件 (关闭自动签名)
-      - name: Configure Xcode Project (Force Manual)
+      # 18. 配置 Xcode (手动签名强制覆盖)
+      - name: Configure Xcode Project (Manual Signing)
         working-directory: ./flutter/ios
         run: |
-          echo "🔧 Disabling Automatic Signing in pbxproj..."
-          # 将所有 ProvisioningStyle 从 Automatic 改为 Manual
+          # 强制将 ProvisioningStyle 改为 Manual
           sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' Runner.xcodeproj/project.pbxproj
           
           # 强制其他设置
@@ -238,13 +249,12 @@ jobs:
           sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
           sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
 
-      # 19. Build (Fake Signed, No Ignore Error)
+      # 19. Build & Extract
       - name: Build App via Xcodebuild
         working-directory: ./flutter/ios
         run: |
           echo "🚀 Starting xcodebuild build..."
           
-          # 移除了 || true，我们要求它必须成功
           xcodebuild build \
             -workspace Runner.xcworkspace \
             -scheme Runner \
