@@ -1,4 +1,4 @@
-name: Build RustDesk 1.4.0 IPA (Final V105)
+name: Build RustDesk 1.4.0 IPA (Final V106)
 
 on:
   workflow_dispatch:
@@ -102,13 +102,12 @@ jobs:
           if [ ! -f "src/inline.rs" ]; then echo '// Dummy inline' > src/inline.rs; fi
           touch src/bridge_generated.rs
 
-      # 10. 安装 Codegen (1.80.1)
+      # 10. 安装 Codegen
       - name: Install Bridge Codegen
         run: |
           cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
 
-      # 11. 【核心】创建并信任伪造证书
-      # 使用 Legacy 算法生成 P12，确保 macOS 能识别
+      # 11. 【关键】创建并信任伪造证书
       - name: Setup Fake Signing Identity
         run: |
           echo "🔐 Creating Keychain..."
@@ -122,6 +121,7 @@ jobs:
             -keyout selfsigned.key -out selfsigned.crt \
             -subj "/CN=iPhone Developer/C=US"
           
+          # 使用兼容参数导出 P12 (Fix MAC verification failed)
           openssl pkcs12 -export -in selfsigned.crt -inkey selfsigned.key \
             -out selfsigned.p12 -name "iPhone Developer" \
             -passout pass:123456 \
@@ -131,10 +131,9 @@ jobs:
           security import selfsigned.p12 -k build.keychain -P "123456" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "123456" build.keychain
           
-          echo "✅ Certificate Ready."
+          echo "✅ Fake 'iPhone Developer' identity ready."
 
-      # 12. 【核心】Podfile 全域签名注入
-      # 强制 Runner 和 所有 Pods 使用我们的假证书
+      # 12. Podfile 注入
       - name: Inject Podfile Config
         working-directory: ./flutter/ios
         run: |
@@ -143,10 +142,6 @@ jobs:
           path = 'Podfile'
           with open(path, 'r') as f: content = f.read()
           
-          # 1. 升级 Platform
-          content = re.sub(r'platform :ios, .*', \"platform :ios, '13.0'\", content)
-
-          # 2. 注入 Hook (处理 Runner 配置)
           target_str = 'flutter_additional_ios_build_settings(target)'
           injection = \"\"\"
             flutter_additional_ios_build_settings(target)
@@ -157,7 +152,7 @@ jobs:
               config.build_settings['ARCHS'] = 'arm64'
               config.build_settings['DT_TOOLCHAIN_DIR'] = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain'
               
-              # 启用伪造签名
+              # 强制使用 Manual 签名模式
               config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
               config.build_settings['CODE_SIGN_IDENTITY'] = 'iPhone Developer'
               config.build_settings['CODE_SIGNING_REQUIRED'] = 'YES'
@@ -167,35 +162,10 @@ jobs:
             end
           \"\"\"
           
-          # 3. 追加 Hook (处理 Pods 配置)
-          pods_hook = \"\"\"
-          post_install do |installer|
-            installer.pods_project.targets.each do |target|
-              target.build_configurations.each do |config|
-                config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
-                config.build_settings['ENABLE_BITCODE'] = 'NO'
-                # 强制 Pods 也用假证书
-                config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
-                config.build_settings['CODE_SIGN_IDENTITY'] = 'iPhone Developer'
-                config.build_settings['CODE_SIGNING_REQUIRED'] = 'YES'
-                config.build_settings['CODE_SIGNING_ALLOWED'] = 'YES'
-                config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = ''
-                config.build_settings['DEVELOPMENT_TEAM'] = ''
-              end
-            end
-          end
-          \"\"\"
-
           if re.search(r'(\s*flutter_additional_ios_build_settings\(target\))', content):
               new_content = re.sub(r'(\s*flutter_additional_ios_build_settings\(target\))', injection, content)
-              
-              # 简单的追加 pods_hook 到文件末尾
-              # 注意：如果文件里已有 post_install，这可能会警告，但在 Flutter Podfile 中通常只有一个默认的
-              # 我们直接追加，因为默认 Podfile 结构通常允许
-              new_content += \"\\n\" + pods_hook
-              
               with open(path, 'w') as f: f.write(new_content)
-              print('✅ Podfile patched with Global Fake-Sign.')
+              print('✅ Podfile patched.')
           else:
               exit(1)
           "
@@ -254,13 +224,27 @@ jobs:
         working-directory: ./flutter
         run: flutter build ios --config-only
 
-      # 18. Build (Fake Signed)
+      # 18. 【核心修复】修改 Project 文件 (关闭自动签名)
+      - name: Configure Xcode Project (Force Manual)
+        working-directory: ./flutter/ios
+        run: |
+          echo "🔧 Disabling Automatic Signing in pbxproj..."
+          # 将所有 ProvisioningStyle 从 Automatic 改为 Manual
+          sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' Runner.xcodeproj/project.pbxproj
+          
+          # 强制其他设置
+          sed -i '' 's/CODE_SIGN_IDENTITY = ".*";/CODE_SIGN_IDENTITY = "iPhone Developer";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGNING_REQUIRED = NO/CODE_SIGNING_REQUIRED = YES/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = ".*";/PROVISIONING_PROFILE_SPECIFIER = "";/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/DevelopmentTeam = .*/DevelopmentTeam = "";/g' Runner.xcodeproj/project.pbxproj
+
+      # 19. Build (Fake Signed, No Ignore Error)
       - name: Build App via Xcodebuild
         working-directory: ./flutter/ios
         run: |
-          echo "🚀 Starting xcodebuild build (Fake Signed)..."
+          echo "🚀 Starting xcodebuild build..."
           
-          # 传递明确的签名参数，覆盖可能未生效的配置
+          # 移除了 || true，我们要求它必须成功
           xcodebuild build \
             -workspace Runner.xcworkspace \
             -scheme Runner \
@@ -273,35 +257,21 @@ jobs:
             PROVISIONING_PROFILE_SPECIFIER="" \
             DEVELOPMENT_TEAM="" \
             -derivedDataPath build \
-            -allowProvisioningUpdates || true
+            -allowProvisioningUpdates
             
-          # 查找生成的 .app
           APP_DIR=$(find build -name "Runner.app" | grep "Release-iphoneos" | head -n 1)
           
-          if [ -n "$APP_DIR" ] && [ -d "$APP_DIR" ]; then
-             echo "✅ Build success! Found at $APP_DIR"
-             
-             # 【关键】验证二进制文件是否存在
-             if [ -f "$APP_DIR/Runner" ]; then
-                 SIZE=$(ls -lh "$APP_DIR/Runner" | awk '{print $5}')
-                 echo "✅ Binary verified. Size: $SIZE"
-                 
-                 mkdir Payload
-                 cp -r "$APP_DIR" Payload/
-                 zip -r RustDesk_1.4.0_Unsigned.ipa Payload
-                 echo "✅ IPA created successfully."
-             else
-                 echo "❌ Binary 'Runner' missing inside .app bundle! Build actually failed."
-                 ls -R "$APP_DIR"
-                 exit 1
-             fi
+          if [ -f "$APP_DIR/Runner" ]; then
+             echo "✅ Build success! Binary size: $(ls -lh $APP_DIR/Runner | awk '{print $5}')"
+             mkdir Payload
+             cp -r "$APP_DIR" Payload/
+             zip -r RustDesk_1.4.0_Unsigned.ipa Payload
           else
-             echo "❌ Build failed. App not found."
-             ls -R build || true
+             echo "❌ Build failed. Binary not generated."
              exit 1
           fi
 
-      # 19. 上传
+      # 20. 上传
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
